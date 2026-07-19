@@ -1,0 +1,46 @@
+# Git / docs / IDE
+.git
+.gitignore
+.gitattributes
+.github
+.idea
+.vscode
+*.md
+!README.md
+
+# Dependencies (reinstalled in image)
+node_modules
+client/node_modules
+
+# Build artifacts (rebuilt in image)
+client/dist
+dist
+.cache
+tmp
+temp
+*.log
+coverage
+*.tsbuildinfo
+
+# Secrets — inject via platform env vars
+.env
+.env.*
+!.env.example
+
+# Local / OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+**/*.pyc
+__pycache__
+.venv
+venv
+
+# Optional ML not used in production scoring path
+server/ml
+requirements.txt
+*.tar
+
+# Tests not needed at runtime
+**/*.test.ts
+**/benford.test.ts

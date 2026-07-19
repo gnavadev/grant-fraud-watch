@@ -1,0 +1,19 @@
+# Free-tier friendly Render Blueprint
+# https://render.com — New → Blueprint → connect this repo
+#
+# After deploy: set FAC_API_KEY and SAM_API_KEY in the dashboard
+# (sync: false means you paste secrets yourself; they are not in git).
+
+services:
+  - type: web
+    name: grant-fraud-watch
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FAC_API_KEY
+        sync: false
+      - key: SAM_API_KEY
+        sync: false

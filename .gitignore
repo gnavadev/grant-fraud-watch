@@ -1,0 +1,73 @@
+# Dependencies
+node_modules/
+client/node_modules/
+**/node_modules/
+
+# Build output
+dist/
+client/dist/
+build/
+*.tsbuildinfo
+
+# Local data / runtime cache (API responses, UEI lookups)
+.cache/
+client/.cache/
+tmp/
+temp/
+*.tmp
+
+# Environment & secrets — never commit real keys
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.staging
+# Keep the template for deploy docs
+!.env.example
+
+# Logs & debug
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+*.swp
+*.swo
+*~
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Python (optional local ML leftovers)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env.venv/
+
+# Docker local artifacts
+*.tar
+
+# Local deploy / platform state
+.railway/
+.render/
+.fly/
+.vercel/
+.netlify/
+
+# Optional local notes / screenshots
+*.pem
+*.key
+secrets/
