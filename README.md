@@ -29,11 +29,6 @@ cp .env.example .env
 npm run dev
 ```
 
-- **App (Vite):** http://localhost:5173  
-- **API:** http://localhost:3001/api/health  
-
-Production-style (single process, built client):
-
 ```bash
 npm run build
 npm start
