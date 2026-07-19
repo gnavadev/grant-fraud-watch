@@ -166,7 +166,11 @@ export function FacilityDeepDive({ facility: f, onClose }: Props) {
             <StatCard
               label="Grant total"
               value={formatCurrency(f.grantReceived)}
-              sub={`${f.awardCount} award${f.awardCount === 1 ? "" : "s"}`}
+              sub={
+                f.grantsHydrated
+                  ? `${f.awardCount} grant${f.awardCount === 1 ? "" : "s"} (last ~10 years, full list)`
+                  : `${f.awardCount} grant${f.awardCount === 1 ? "" : "s"} (search sample only, full list not loaded)`
+              }
             />
             <StatCard
               label="Average award"
@@ -222,7 +226,7 @@ export function FacilityDeepDive({ facility: f, onClose }: Props) {
             </div>
           </section>
 
-          {/* Digit pattern — always shown; blend weight scales with n */}
+          {/* Digit pattern, always shown; blend weight scales with n */}
           <section>
             <h3 className="text-sm font-semibold text-stone-900">
               Do the digits look natural?
@@ -244,10 +248,10 @@ export function FacilityDeepDive({ facility: f, onClose }: Props) {
                     Based on {f.benford.sampleSize} amount
                     {f.benford.sampleSize === 1 ? "" : "s"}
                     {f.benford.sampleSize < 100
-                      ? " — small sample, so this barely affects the overall score (mostly noise below ~100)."
+                      ? ", small sample, so this barely affects the overall score (mostly noise below ~100)."
                       : f.benford.sampleSize < 300
-                        ? " — moderate sample; digit pattern has limited weight."
-                        : " — large sample; digit pattern can weigh more (still secondary to audits/SAM)."}
+                        ? ", moderate sample; digit pattern has limited weight."
+                        : ", large sample; digit pattern can weigh more (still secondary to audits/SAM)."}
                   </p>
                 </>
               ) : (

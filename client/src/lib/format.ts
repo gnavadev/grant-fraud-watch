@@ -10,7 +10,8 @@ export function formatPercent(value: number): string {
   return `${Math.round(value)}%`;
 }
 
+/** Empty table/field placeholder (em dash is fine for blank values). */
 export function dash(value: string | null | undefined): string {
-  if (value == null || value === "") return "-";
+  if (value == null || value === "") return "—";
   return value;
 }

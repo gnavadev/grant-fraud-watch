@@ -70,6 +70,8 @@ export interface Facility {
   state: string | null;
   grantReceived: number;
   awardCount: number;
+  /** True when grant count is the full recipient list (not search sample only). */
+  grantsHydrated?: boolean;
   sampleCount: number;
   fraudChance: number | null;
   fraudLabel: FraudLabel;

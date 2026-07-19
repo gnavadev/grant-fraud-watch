@@ -18,7 +18,7 @@ export function facilityLinks(f: Facility): FacilityLink[] {
   const reportId = f.enrichment?.fac?.reportId?.trim() || null;
   const samFound = Boolean(f.enrichment?.sam?.found);
 
-  // USAspending — prefer direct recipient profile
+  // USAspending, prefer direct recipient profile
   if (recipientId) {
     links.push({
       label: "USAspending facility profile",
@@ -42,7 +42,7 @@ export function facilityLinks(f: Facility): FacilityLink[] {
     });
   }
 
-  // SAM.gov — entity pages only when SAM returned a public match
+  // SAM.gov, entity pages only when SAM returned a public match
   if (uei && samFound) {
     links.push({
       label: "SAM.gov entity (UEI)",
@@ -61,7 +61,7 @@ export function facilityLinks(f: Facility): FacilityLink[] {
       label: "SAM.gov entity",
       href: null,
       description:
-        "Not available — company opted out of public display or no public SAM match",
+        "Not available, company opted out of public display or no public SAM match",
       available: false,
     });
   } else {
@@ -73,7 +73,7 @@ export function facilityLinks(f: Facility): FacilityLink[] {
     });
   }
 
-  // FAC — only real deep links via report_id. Search page query params do not work.
+  // FAC, only real deep links via report_id. Search page query params do not work.
   if (facFound && reportId) {
     links.push({
       label: "FAC Single Audit summary",
@@ -94,12 +94,12 @@ export function facilityLinks(f: Facility): FacilityLink[] {
       label: "FAC Single Audit",
       href: null,
       description:
-        "Not available — no Single Audit on file for this facility in FAC",
+        "Not available, no Single Audit on file for this facility in FAC",
       available: false,
     });
   }
 
-  // Federal program / CFDA SAM FAL URLs are unreliable (often client-side 404) — omitted.
+  // Federal program / CFDA SAM FAL URLs are unreliable (often client-side 404), omitted.
 
   return links;
 }

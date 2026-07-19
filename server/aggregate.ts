@@ -26,6 +26,7 @@ import type {
 import {
   extractCfdaFromAward,
   fetchCfdaBaseline,
+  fetchGrantsForRecipient,
   fetchUeiForRecipientId,
   type CfdaBaseline,
 } from "./usaspending.js";
@@ -42,6 +43,15 @@ interface MutableFacility {
   usedTransactions: boolean;
   cfdaCounts: Map<string, number>;
   awardTypes: Set<string>;
+  /** True after full recipient grant pull (true count, not search sample). */
+  grantsHydrated: boolean;
+  /** Awards seen in the initial search sample only (debug / fallback). */
+  sampleAwardCount: number;
+  /**
+   * Total grant awards from full recipient pull (USASpending Grants tab).
+   * When set, this is what we show as awardCount, not sample size.
+   */
+  hydratedGrantCount: number | null;
 }
 
 function facilityKeyFromAward(award: AwardRow): string {
@@ -80,6 +90,9 @@ function groupAwards(awards: AwardRow[]): MutableFacility[] {
         usedTransactions: false,
         cfdaCounts: new Map(),
         awardTypes: new Set(),
+        grantsHydrated: false,
+        sampleAwardCount: 0,
+        hydratedGrantCount: null,
       };
       map.set(key, facility);
     } else {
@@ -88,6 +101,8 @@ function groupAwards(awards: AwardRow[]): MutableFacility[] {
       if (!facility.state && loc.state) facility.state = loc.state;
       if (!facility.uei && uei) facility.uei = uei;
     }
+
+    facility.sampleAwardCount += 1;
 
     const amount = award["Award Amount"];
     if (typeof amount === "number" && Number.isFinite(amount) && amount !== 0) {
@@ -177,7 +192,83 @@ export interface AggregateResult {
     facLookups: number;
     samLookups: number;
     subawardRows: number;
+    grantsHydrated: number;
   };
+}
+
+/**
+ * Replace sample awards with the recipient's full grant list (last ~10y).
+ * Sets true awardCount (e.g. 19) and scoring amounts from all grants.
+ *
+ * Hydrates every facility in the result set. The old cap of 80 used map
+ * insertion order (first appearance in the amount-sorted sample), which
+ * skipped orgs that only had one mid-ranked sample row (e.g. OCHCA → 1).
+ */
+async function hydrateFullGrants(groups: MutableFacility[]): Promise<number> {
+  // Largest sample totals first (better UX if a host times out mid-search)
+  const targets = [...groups].sort((a, b) => {
+    const sa = a.awardAmounts.reduce((s, x) => s + Math.abs(x), 0);
+    const sb = b.awardAmounts.reduce((s, x) => s + Math.abs(x), 0);
+    return sb - sa;
+  });
+  let hydrated = 0;
+
+  // Low concurrency, USAspending also throttles inside fetchGrantsForRecipient
+  await mapPool(targets, 2, async (g) => {
+    try {
+      const { awards } = await fetchGrantsForRecipient({
+        uei: g.uei,
+        name: g.name,
+      });
+      if (awards.length === 0) return;
+
+      // Prefer UEI from full pull if missing
+      if (!g.uei) {
+        for (const a of awards) {
+          if (a["Recipient UEI"]) {
+            g.uei = String(a["Recipient UEI"]).trim().toUpperCase();
+            break;
+          }
+        }
+      }
+
+      const amounts: number[] = [];
+      const cfdaCounts = new Map<string, number>();
+      const awardTypes = new Set<string>();
+
+      for (const award of awards) {
+        const amount = award["Award Amount"];
+        if (
+          typeof amount === "number" &&
+          Number.isFinite(amount) &&
+          amount !== 0
+        ) {
+          amounts.push(amount);
+        }
+        const cfda = extractCfdaFromAward(award);
+        if (cfda) {
+          cfdaCounts.set(cfda, (cfdaCounts.get(cfda) ?? 0) + 1);
+        }
+        if (award["Award Type"]) {
+          awardTypes.add(String(award["Award Type"]));
+        }
+      }
+
+      // awardCount is awards.length (matches USASpending Grants tab);
+      // amounts drive dollars + scoring.
+      g.awardAmounts = amounts;
+      g.scoreAmounts = cleanAmountsForScoring(amounts);
+      g.cfdaCounts = cfdaCounts.size > 0 ? cfdaCounts : g.cfdaCounts;
+      g.awardTypes = awardTypes.size > 0 ? awardTypes : g.awardTypes;
+      g.grantsHydrated = true;
+      g.hydratedGrantCount = awards.length;
+      hydrated += 1;
+    } catch {
+      /* keep sample-based data */
+    }
+  });
+
+  return hydrated;
 }
 
 export async function aggregateAwardsToFacilities(
@@ -212,6 +303,9 @@ export async function aggregateAwardsToFacilities(
     if (uei) g.uei = uei;
   });
 
+  // Full grant lists per recipient → true award counts (e.g. 19) + scoring amounts
+  const grantsHydratedCount = await hydrateFullGrants(groups);
+
   // CFDA baselines (national program references)
   const cfdaNeeded = new Set<string>();
   for (const g of groups) {
@@ -239,30 +333,51 @@ export async function aggregateAwardsToFacilities(
   // Temporal from transactions
   const txnByRecipient = groupTransactionsByRecipient(transactions);
 
-  // FAC + SAM by UEI (capped concurrency; unique UEIs only)
-  const ueiList = [
-    ...new Set(
-      groups.map((g) => g.uei).filter((u): u is string => Boolean(u)),
-    ),
-  ].slice(0, 40);
-
+  // FAC + SAM by UEI. SAM is heavily rate-limited (often daily quota) so we:
+  //  - prefer largest grant recipients first
+  //  - call fewer unique UEIs for SAM than FAC
+  //  - never burst SAM (throttle lives inside fetchSamByUei)
   type FacData = Awaited<ReturnType<typeof fetchFacByUei>>;
   type SamData = Awaited<ReturnType<typeof fetchSamByUei>>;
   const facByUei = new Map<string, FacData>();
   const samByUei = new Map<string, SamData>();
 
-  // Cap concurrent FAC+SAM pairs for free-host memory
-  await mapPool(ueiList, 3, async (uei) => {
-    const [fac, sam] = await Promise.all([
-      fetchFacByUei(uei),
-      fetchSamByUei(uei),
-    ]);
-    facByUei.set(uei, fac);
-    samByUei.set(uei, sam);
+  const groupsByGrant = [...groups].sort((a, b) => {
+    const sa = a.awardAmounts.reduce((s, x) => s + Math.abs(x), 0);
+    const sb = b.awardAmounts.reduce((s, x) => s + Math.abs(x), 0);
+    return sb - sa;
   });
 
+  const facUeis = [
+    ...new Set(
+      groupsByGrant.map((g) => g.uei).filter((u): u is string => Boolean(u)),
+    ),
+  ].slice(0, 40);
+
+  // SAM: only top recipients (quota is tight on free keys)
+  const MAX_SAM_LOOKUPS = 12;
+  const samUeis = [
+    ...new Set(
+      groupsByGrant.map((g) => g.uei).filter((u): u is string => Boolean(u)),
+    ),
+  ].slice(0, MAX_SAM_LOOKUPS);
+
+  // FAC can run with modest concurrency; SAM is serialized in sam.ts
+  await mapPool(facUeis, 2, async (uei) => {
+    facByUei.set(uei, await fetchFacByUei(uei));
+  });
+
+  // Sequential SAM path (throttle + cache + circuit breaker handle 429s)
+  for (const uei of samUeis) {
+    samByUei.set(uei, await fetchSamByUei(uei));
+  }
+
   const facilities: Facility[] = groups.map((m) => {
-    const awardCount = positiveAmounts(m.awardAmounts).length;
+    // Prefer full recipient grant count (USASpending Grants tab), not sample size
+    const awardCount =
+      m.hydratedGrantCount != null
+        ? m.hydratedGrantCount
+        : positiveAmounts(m.awardAmounts).length;
     const grantReceived = positiveAmounts(m.awardAmounts).reduce(
       (a, b) => a + b,
       0,
@@ -314,6 +429,7 @@ export async function aggregateAwardsToFacilities(
       state: m.state,
       grantReceived,
       awardCount,
+      grantsHydrated: m.grantsHydrated,
       sampleCount: features.n,
       fraudChance: multi.multiScore,
       fraudLabel: fraudLabelFromChance(multi.multiScore),
@@ -395,6 +511,7 @@ export async function aggregateAwardsToFacilities(
       facLookups: facByUei.size,
       samLookups: samByUei.size,
       subawardRows,
+      grantsHydrated: grantsHydratedCount,
     },
   };
 }
@@ -468,7 +585,7 @@ export async function rescoreFacility(input: {
   });
 
   // After a retry attempt we always settle: show score (or N/A), never keep spinning.
-  // Partial enrichment (e.g. SAM down) is fine — score without that data.
+  // Partial enrichment (e.g. SAM down) is fine, score without that data.
   return {
     ...f,
     fraudChance: multi.multiScore,

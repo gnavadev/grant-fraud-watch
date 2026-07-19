@@ -61,7 +61,7 @@ npm start       # node dist/index.js
 4. Set env: `FAC_API_KEY`, `SAM_API_KEY`.
 5. Open `https://….onrender.com`.
 
-**Free tier:** spins down after ~15 min idle; first request can take ~1 minute (banner explains this). Cache is wiped on sleep — normal.
+**Free tier:** spins down after ~15 min idle; first request can take ~1 minute (banner explains this). Cache is wiped on sleep, normal.
 
 ## Environment variables
 

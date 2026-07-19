@@ -129,6 +129,11 @@ export interface Facility {
   state: string | null;
   grantReceived: number;
   awardCount: number;
+  /**
+   * True when awardCount comes from a full recipient grant pull.
+   * False = search-sample only (may undercount).
+   */
+  grantsHydrated?: boolean;
   /** Number of amount observations used for scoring (awards or transactions). */
   sampleCount: number;
   fraudChance: number | null;

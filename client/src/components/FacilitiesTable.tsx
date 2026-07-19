@@ -157,8 +157,18 @@ export function FacilitiesTable({
                     <div className="truncate" title={f.name}>
                       {f.name}
                     </div>
-                    <div className="mt-0.5 text-xs font-normal text-stone-400">
-                      {f.awardCount} award{f.awardCount === 1 ? "" : "s"}
+                    <div
+                      className="mt-0.5 text-xs font-normal text-stone-400"
+                      title={
+                        f.grantsHydrated
+                          ? "All federal grants to this recipient in the last ~10 years (USAspending)"
+                          : "From this search sample only, full grant list not loaded (API busy or failed). Count may be low."
+                      }
+                    >
+                      {f.awardCount} grant{f.awardCount === 1 ? "" : "s"}
+                      {!f.grantsHydrated ? (
+                        <span className="text-stone-400"> · sample</span>
+                      ) : null}
                     </div>
                   </td>
                   <td className="whitespace-nowrap px-4 py-3 text-stone-700">

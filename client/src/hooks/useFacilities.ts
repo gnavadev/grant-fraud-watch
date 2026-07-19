@@ -89,7 +89,7 @@ export function useFacilities(): UseFacilitiesState {
     const attempts = retryCounts.current.get(facility.id) ?? 0;
     if (attempts >= MAX_RETRIES) {
       settled.current.add(facility.id);
-      // Settle with existing partial score — do not spin forever
+      // Settle with existing partial score, do not spin forever
       setFacilities((prev) =>
         prev.map((f) =>
           f.id === facility.id

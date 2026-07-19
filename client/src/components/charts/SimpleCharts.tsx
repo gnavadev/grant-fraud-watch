@@ -1,4 +1,4 @@
-/** Lightweight SVG charts — no chart library needed. */
+/** Lightweight SVG charts, no chart library needed. */
 
 export function HorizontalBars({
   items,

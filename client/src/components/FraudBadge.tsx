@@ -31,7 +31,7 @@ function Spinner() {
 }
 
 export function FraudBadge({ facility }: Props) {
-  // Only spin while a retry is in flight — never stick on "failed"
+  // Only spin while a retry is in flight, never stick on "failed"
   if (facility.scoreStatus === "retrying") {
     return (
       <span
@@ -51,7 +51,7 @@ export function FraudBadge({ facility }: Props) {
         className="inline-flex items-center gap-1.5 rounded-full bg-orange-50 px-2.5 py-1 text-xs font-medium text-orange-900 ring-1 ring-inset ring-orange-200"
         title={
           facility.failReasons?.join(" · ") ||
-          "Enrichment failed — retrying once..."
+          "Enrichment failed, retrying once..."
         }
       >
         <Spinner />

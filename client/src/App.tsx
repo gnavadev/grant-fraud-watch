@@ -114,7 +114,9 @@ export default function App() {
               <ul className="mt-1 list-disc space-y-1 pl-5 leading-relaxed">
                 <li>
                   Awards and transactions from USAspending.gov; audits from
-                  fac.gov; entity data from SAM.gov.
+                  fac.gov; entity data from SAM.gov. Grant counts are the
+                  recipient&apos;s full grant list for the last ~10 years (not
+                  only the search sample).
                 </li>
                 <li>
                   State government spending systems are not integrated (different

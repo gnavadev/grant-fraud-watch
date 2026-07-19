@@ -10,6 +10,7 @@ import { loadEnv, getFacApiKey, getSamApiKey } from "./env.js";
 import { FACILITY_TYPES, isValidFacilityType } from "./facilityTypes.js";
 import { log } from "./logger.js";
 import { rateLimit } from "./rateLimit.js";
+import { getSamQuotaStatus } from "./sam.js";
 import type {
   FacilitiesResponse,
   Facility,
@@ -34,7 +35,7 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 const DISCLAIMER =
-  "Audit-worthiness score from federal awards, FAC Single Audits, and SAM entity data. Not proof of fraud — use for triage only.";
+  "Audit-worthiness score from federal awards, FAC Single Audits, and SAM entity data. Not proof of fraud, use for triage only.";
 
 /** Light rate limit: search endpoints only (protect free tier + upstream APIs). */
 function apiPath(req: express.Request): string {
@@ -63,17 +64,25 @@ app.get("/api/health", (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const facKey = Boolean(getFacApiKey());
   const samKey = Boolean(getSamApiKey());
+  const samQuota = getSamQuotaStatus();
   res.json({
     ok: true,
     service: "grant-fraud-watch",
     uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000),
     facKey,
     samKey,
+    samQuotaBlocked: samQuota.blocked,
+    samQuotaUntil: samQuota.until
+      ? new Date(samQuota.until).toISOString()
+      : null,
     /** Hint for UI when keys missing on free deploy. */
     notes: [
-      !facKey ? "FAC_API_KEY not set — Single Audit enrichment disabled" : null,
+      !facKey ? "FAC_API_KEY not set, Single Audit enrichment disabled" : null,
       !samKey
-        ? "SAM_API_KEY not set — SAM enrichment disabled (keys expire ~90 days)"
+        ? "SAM_API_KEY not set, SAM enrichment disabled (keys expire ~90 days)"
+        : null,
+      samQuota.blocked
+        ? `SAM daily quota exceeded until ${new Date(samQuota.until!).toISOString()}, using cache only`
         : null,
     ].filter(Boolean),
   });

@@ -6,6 +6,8 @@ type Health = {
   samKey?: boolean;
   notes?: string[];
   uptimeSec?: number;
+  samQuotaBlocked?: boolean;
+  samQuotaUntil?: string | null;
 };
 
 /**
@@ -67,27 +69,38 @@ export function ColdStartBanner() {
 
   if (phase === "ready" || phase === "checking") {
     // Key warnings only once ready (no keys set on deploy)
-    if (
-      phase === "ready" &&
-      health &&
-      (health.facKey === false || health.samKey === false)
-    ) {
+    if (phase === "ready" && health) {
+      const showKeys = health.facKey === false || health.samKey === false;
+      const showQuota = health.samQuotaBlocked === true;
+      if (!showKeys && !showQuota) return null;
+
       return (
         <div
           className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950"
           role="status"
         >
-          <p className="font-semibold">API keys incomplete</p>
+          <p className="font-semibold">
+            {showQuota ? "SAM rate limit" : "API keys incomplete"}
+          </p>
           <ul className="mt-1 list-disc pl-5 text-amber-900/90">
+            {showQuota && (
+              <li>
+                SAM.gov daily quota reached
+                {health.samQuotaUntil
+                  ? `, lookups are paused until ${new Date(health.samQuotaUntil).toLocaleString()}`
+                  : ", lookups are paused"}
+                . Cached SAM data still works; other scores are unchanged.
+              </li>
+            )}
             {!health.facKey && (
               <li>
-                FAC key missing — Single Audit enrichment is off. Set{" "}
+                FAC key missing, Single Audit enrichment is off. Set{" "}
                 <code className="text-xs">FAC_API_KEY</code> on the host.
               </li>
             )}
             {!health.samKey && (
               <li>
-                SAM key missing or expired (~90 days) — set{" "}
+                SAM key missing or expired (~90 days), set{" "}
                 <code className="text-xs">SAM_API_KEY</code> on the host
                 (SAM Account Details, not Data.gov).
               </li>
@@ -109,7 +122,7 @@ export function ColdStartBanner() {
         <p className="font-semibold">Waking up the free server…</p>
         <p className="mt-1 text-orange-900/90">
           Free hosts sleep after idle time. First load can take about a minute
-          {elapsedSec > 0 ? ` (${elapsedSec}s so far)` : ""}. This is normal —
+          {elapsedSec > 0 ? ` (${elapsedSec}s so far)` : ""}. This is normal,
           not a bug.
         </p>
       </div>
