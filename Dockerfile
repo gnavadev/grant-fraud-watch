@@ -29,13 +29,16 @@ WORKDIR /app
 
 ENV NODE_ENV=production \
     PORT=3001 \
-    npm_config_update_notifier=false
+    npm_config_update_notifier=false \
+    SAM_DOWNLOAD_EXTRACTS=0
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=server-build /app/dist ./dist
 COPY --from=client-build /app/client/dist ./client/dist
+# Slim SAM indexes (exclusions UEI list; optional entities.sqlite if present)
+COPY data/ ./data/
 
 RUN mkdir -p /app/.cache && chown -R node:node /app
 USER node

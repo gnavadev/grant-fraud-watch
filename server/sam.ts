@@ -1,17 +1,26 @@
 import { cacheGet, cacheSet } from "./cache.js";
 import { getSamApiKey } from "./env.js";
 import { log } from "./logger.js";
+import {
+  ensureSamExclusionsIndex,
+  getSamExtractStatus,
+  isUeiExcluded,
+} from "./samExtract.js";
+import {
+  ensureSamEntityIndex,
+  getEntityFromExtract,
+} from "./samEntityExtract.js";
 import { createThrottle, sleep } from "./throttle.js";
 
 /**
- * SAM.gov Entity Information API (v3).
- * Uses SAM_API_KEY from env (Account Details key, not Data.gov).
+ * SAM risk data for a UEI.
  *
- * Free/public keys are heavily rate-limited (often daily quota). We:
- *  - cache successes 24h
- *  - serialize + space out live requests
- *  - retry transient 429s with backoff
- *  - circuit-break when SAM returns a daily quota / nextAccessTime
+ * Primary path (avoids 10/day Entity API burn):
+ *   1) Public exclusions extract → local UEI set (1 download/day)
+ *   2) Public monthly entity extract → SQLite (registration age / name)
+ *        built via `npm run sam:sync` (not per search)
+ *
+ * Optional live Entity API only when SAM_LIVE_FALLBACK=1.
  */
 
 export interface SamEntitySummary {
@@ -22,9 +31,11 @@ export interface SamEntitySummary {
   registrationDate: string | null;
   registrationAgeDays: number | null;
   registrationStatus: string | null;
-  /** 0–100 risk from SAM registration age + exclusions. */
+  /** 0-100 risk from SAM registration age + exclusions. */
   riskScore: number;
   legalBusinessName: string | null;
+  /** How we resolved this row. */
+  source?: "extract" | "live" | "cache" | "none";
 }
 
 export type SamLookup =
@@ -32,13 +43,14 @@ export type SamLookup =
   | { status: "error"; message: string }
   | { status: "skipped" };
 
-/** ~1.2s between live SAM calls (global process queue). */
 const samThrottle = createThrottle(1200);
-
-/** When set, skip all live SAM calls until this timestamp (ms). */
 let samQuotaBlockedUntil = 0;
-
 const MAX_RETRIES_429 = 3;
+
+function liveFallbackEnabled(): boolean {
+  const v = (process.env.SAM_LIVE_FALLBACK ?? "0").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
 
 function daysSince(iso: string | null | undefined): number | null {
   if (!iso) return null;
@@ -64,45 +76,42 @@ function isExcludedFlag(v: unknown): boolean {
   return s === "Y" || s === "YES" || s === "TRUE" || s === "1";
 }
 
-function parseQuotaBlock(body: string, retryAfterHeader: string | null): number | null {
-  // e.g. nextAccessTime":"2026-Jul-20 00:00:00+0000 UTC"
+function parseQuotaBlock(
+  body: string,
+  retryAfterHeader: string | null,
+): number | null {
   const next =
     body.match(/nextAccessTime["']?\s*:\s*["']([^"']+)["']/i)?.[1] ??
-    body.match(/after\s+(\d{4}-[A-Za-z]{3}-\d{2}\s+\d{2}:\d{2}:\d{2}[^\s"]*)/i)?.[1];
+    body.match(
+      /after\s+(\d{4}-[A-Za-z]{3}-\d{2}\s+\d{2}:\d{2}:\d{2}[^\s"]*)/i,
+    )?.[1];
   if (next) {
-    // Normalize "2026-Jul-20 00:00:00+0000 UTC" → something Date can parse
     const normalized = next
       .replace(/\+0000\s*UTC/i, "Z")
-      .replace(
-        /(\d{4})-([A-Za-z]{3})-(\d{2})/,
-        (_, y, mon, d) => {
-          const months: Record<string, string> = {
-            Jan: "01",
-            Feb: "02",
-            Mar: "03",
-            Apr: "04",
-            May: "05",
-            Jun: "06",
-            Jul: "07",
-            Aug: "08",
-            Sep: "09",
-            Oct: "10",
-            Nov: "11",
-            Dec: "12",
-          };
-          return `${y}-${months[mon] ?? "01"}-${d}`;
-        },
-      );
+      .replace(/(\d{4})-([A-Za-z]{3})-(\d{2})/, (_, y, mon, d) => {
+        const months: Record<string, string> = {
+          Jan: "01",
+          Feb: "02",
+          Mar: "03",
+          Apr: "04",
+          May: "05",
+          Jun: "06",
+          Jul: "07",
+          Aug: "08",
+          Sep: "09",
+          Oct: "10",
+          Nov: "11",
+          Dec: "12",
+        };
+        return `${y}-${months[mon] ?? "01"}-${d}`;
+      });
     const t = Date.parse(normalized);
     if (Number.isFinite(t) && t > Date.now()) return t;
   }
   if (retryAfterHeader) {
     const sec = Number(retryAfterHeader);
-    if (Number.isFinite(sec) && sec > 0) {
-      return Date.now() + sec * 1000;
-    }
+    if (Number.isFinite(sec) && sec > 0) return Date.now() + sec * 1000;
   }
-  // Daily-style throttle without parseable time → block 1 hour as soft backoff
   if (/quota|throttled|exceeded/i.test(body)) {
     return Date.now() + 60 * 60 * 1000;
   }
@@ -119,7 +128,12 @@ export function getSamQuotaStatus(): {
   return { blocked: false, until: null };
 }
 
-function emptySummary(uei: string): SamEntitySummary {
+export { getSamExtractStatus };
+
+function emptySummary(
+  uei: string,
+  source: SamEntitySummary["source"] = "none",
+): SamEntitySummary {
   return {
     uei,
     found: false,
@@ -130,14 +144,14 @@ function emptySummary(uei: string): SamEntitySummary {
     registrationStatus: null,
     riskScore: 0,
     legalBusinessName: null,
+    source,
   };
 }
 
-function summaryFromEntity(
+function summaryFromLiveEntity(
   clean: string,
   entity: {
     entityRegistration?: {
-      ueiSAM?: string;
       legalBusinessName?: string;
       registrationDate?: string;
       registrationStatus?: string;
@@ -145,14 +159,24 @@ function summaryFromEntity(
       ueiStatus?: string;
     };
   },
+  extractExcluded: boolean | null,
 ): SamEntitySummary {
   const reg = entity.entityRegistration;
-  if (!reg) return emptySummary(clean);
+  if (!reg) {
+    const s = emptySummary(clean, "live");
+    if (extractExcluded) {
+      s.found = true;
+      s.excluded = true;
+      s.exclusionCount = 1;
+      s.riskScore = 85;
+    }
+    return s;
+  }
 
   const regDate = reg.registrationDate ?? null;
   const age = daysSince(regDate);
-  const excluded = isExcludedFlag(reg.exclusionStatusFlag);
-  const exclusionCount = excluded ? 1 : 0;
+  const flagExcluded = isExcludedFlag(reg.exclusionStatusFlag);
+  const excluded = extractExcluded === true || flagExcluded;
 
   let riskScore = ageRisk(age);
   if (excluded) riskScore = Math.min(100, riskScore + 85);
@@ -161,71 +185,53 @@ function summaryFromEntity(
     uei: clean,
     found: true,
     excluded,
-    exclusionCount,
+    exclusionCount: excluded ? 1 : 0,
     registrationDate: regDate,
     registrationAgeDays: age,
     registrationStatus: reg.registrationStatus ?? reg.ueiStatus ?? null,
     riskScore: Math.min(100, riskScore),
     legalBusinessName: reg.legalBusinessName ?? null,
+    source: "live",
   };
 }
 
-async function samFetchOnce(
-  apiKey: string,
-  clean: string,
-): Promise<Response> {
-  const url =
-    `https://api.sam.gov/entity-information/v3/entities` +
-    `?api_key=${encodeURIComponent(apiKey)}` +
-    `&ueiSAM=${encodeURIComponent(clean)}` +
-    `&includeSections=entityRegistration,coreData`;
-
-  return fetch(url, {
-    headers: { Accept: "application/json" },
-    signal: AbortSignal.timeout(25000),
-  });
-}
-
-/**
- * Live SAM lookup with global throttle + 429 retries.
- * Must only be called for uncached UEIs.
- */
 async function fetchSamLive(
   apiKey: string,
   clean: string,
+  extractExcluded: boolean | null,
 ): Promise<SamLookup> {
   if (Date.now() < samQuotaBlockedUntil) {
-    const until = new Date(samQuotaBlockedUntil).toISOString();
     return {
       status: "error",
-      message: `SAM daily quota exceeded, retry after ${until}`,
+      message: `SAM daily quota exceeded, retry after ${new Date(samQuotaBlockedUntil).toISOString()}`,
     };
   }
 
   return samThrottle(async () => {
-    // Re-check after waiting in queue
     if (Date.now() < samQuotaBlockedUntil) {
-      const until = new Date(samQuotaBlockedUntil).toISOString();
       return {
         status: "error" as const,
-        message: `SAM daily quota exceeded, retry after ${until}`,
+        message: `SAM daily quota exceeded, retry after ${new Date(samQuotaBlockedUntil).toISOString()}`,
       };
     }
 
+    const url =
+      `https://api.sam.gov/entity-information/v3/entities` +
+      `?api_key=${encodeURIComponent(apiKey)}` +
+      `&ueiSAM=${encodeURIComponent(clean)}` +
+      `&includeSections=entityRegistration,coreData`;
+
     for (let attempt = 0; attempt <= MAX_RETRIES_429; attempt++) {
       try {
-        const res = await samFetchOnce(apiKey, clean);
+        const res = await fetch(url, {
+          headers: { Accept: "application/json" },
+          signal: AbortSignal.timeout(25000),
+        });
 
         if (res.status === 429) {
           const text = await res.text().catch(() => "");
-          const retryAfter = res.headers.get("retry-after");
-          const blockUntil = parseQuotaBlock(text, retryAfter);
-
-          // Hard daily quota → circuit break
-          if (
-            blockUntil &&
-            blockUntil - Date.now() > 5 * 60 * 1000 // >5 min = treat as quota
-          ) {
+          const blockUntil = parseQuotaBlock(text, res.headers.get("retry-after"));
+          if (blockUntil && blockUntil - Date.now() > 5 * 60 * 1000) {
             samQuotaBlockedUntil = blockUntil;
             log.warn("sam_quota_blocked", {
               uei: clean,
@@ -236,24 +242,13 @@ async function fetchSamLive(
               message: `SAM daily quota exceeded, retry after ${new Date(blockUntil).toISOString()}`,
             };
           }
-
-          const waitMs = blockUntil
-            ? Math.min(blockUntil - Date.now(), 30_000)
-            : Math.min(1000 * 2 ** attempt, 15_000);
-
-          log.warn("sam_429_retry", {
-            uei: clean,
-            attempt,
-            waitMs,
-          });
-
           if (attempt === MAX_RETRIES_429) {
             return {
               status: "error" as const,
               message: "SAM HTTP 429 (rate limited)",
             };
           }
-          await sleep(Math.max(waitMs, 1500));
+          await sleep(Math.max(blockUntil ? blockUntil - Date.now() : 2000, 1500));
           continue;
         }
 
@@ -274,21 +269,28 @@ async function fetchSamLive(
         const data = (await res.json()) as {
           entityData?: Array<{
             entityRegistration?: {
-              ueiSAM?: string;
               legalBusinessName?: string;
               registrationDate?: string;
               registrationStatus?: string;
               exclusionStatusFlag?: string | boolean;
               ueiStatus?: string;
             };
-            coreData?: unknown;
           }>;
         };
 
         const entity = data.entityData?.[0];
         const summary = entity
-          ? summaryFromEntity(clean, entity)
-          : emptySummary(clean);
+          ? summaryFromLiveEntity(clean, entity, extractExcluded)
+          : (() => {
+              const s = emptySummary(clean, "live");
+              if (extractExcluded) {
+                s.found = true;
+                s.excluded = true;
+                s.exclusionCount = 1;
+                s.riskScore = 85;
+              }
+              return s;
+            })();
 
         await cacheSet(`sam_${clean}`, summary);
         return { status: "ok" as const, data: summary };
@@ -309,6 +311,9 @@ async function fetchSamLive(
   });
 }
 
+/**
+ * Resolve SAM risk for a UEI using exclusions extract first (no per-UEI quota burn).
+ */
 export async function fetchSamByUei(uei: string): Promise<SamLookup> {
   const apiKey = getSamApiKey();
   if (!apiKey || !uei?.trim()) return { status: "skipped" };
@@ -316,15 +321,66 @@ export async function fetchSamByUei(uei: string): Promise<SamLookup> {
   const clean = uei.trim().toUpperCase();
   const cacheKey = `sam_${clean}`;
   const cached = await cacheGet<SamEntitySummary>(cacheKey, 24 * 60 * 60 * 1000);
-  if (cached) return { status: "ok", data: cached };
+  if (cached) {
+    return { status: "ok", data: { ...cached, source: cached.source ?? "cache" } };
+  }
 
+  // Ensure daily exclusions index (1 download/day, not 1/UEI)
+  await ensureSamExclusionsIndex();
+  // Use monthly entity SQLite if present (no download here)
+  await ensureSamEntityIndex();
+  const extractExcluded = isUeiExcluded(clean);
+  const entityRow = getEntityFromExtract(clean);
+
+  // Default path: extracts only (no live Entity API)
+  if (!liveFallbackEnabled()) {
+    const excluded = extractExcluded === true;
+    const regDate = entityRow?.registrationDate ?? null;
+    const age = daysSince(regDate);
+    let riskScore = ageRisk(age);
+    if (excluded) riskScore = Math.min(100, riskScore + 85);
+
+    const summary: SamEntitySummary = {
+      uei: clean,
+      found: Boolean(entityRow) || excluded,
+      excluded,
+      exclusionCount: excluded ? 1 : 0,
+      registrationDate: regDate,
+      registrationAgeDays: age,
+      registrationStatus: entityRow?.registrationStatus ?? null,
+      riskScore: Math.min(100, riskScore),
+      legalBusinessName: entityRow?.legalBusinessName ?? null,
+      source: "extract",
+    };
+    await cacheSet(cacheKey, summary);
+    return { status: "ok", data: summary };
+  }
+
+  // Optional live enrichment (registration age) when explicitly enabled
   if (Date.now() < samQuotaBlockedUntil) {
-    const until = new Date(samQuotaBlockedUntil).toISOString();
+    // Still return extract exclusion result
+    if (extractExcluded === true) {
+      return {
+        status: "ok",
+        data: {
+          uei: clean,
+          found: true,
+          excluded: true,
+          exclusionCount: 1,
+          registrationDate: null,
+          registrationAgeDays: null,
+          registrationStatus: null,
+          riskScore: 85,
+          legalBusinessName: null,
+          source: "extract",
+        },
+      };
+    }
     return {
       status: "error",
-      message: `SAM daily quota exceeded, retry after ${until}`,
+      message: `SAM daily quota exceeded, retry after ${new Date(samQuotaBlockedUntil).toISOString()}`,
     };
   }
 
-  return fetchSamLive(apiKey, clean);
+  return fetchSamLive(apiKey, clean, extractExcluded);
 }

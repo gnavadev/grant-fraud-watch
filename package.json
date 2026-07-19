@@ -13,8 +13,12 @@
     "build": "npm run build:client && npm run build:server",
     "start": "node dist/index.js",
     "start:dev": "tsx server/index.ts",
-    "test": "tsx server/benford.test.ts && tsx server/location.test.ts && tsx server/links.test.ts && tsx server/logger.test.ts",
+    "test": "tsx server/benford.test.ts && tsx server/location.test.ts && tsx server/links.test.ts && tsx server/logger.test.ts && tsx server/samExtract.test.ts && tsx server/samEntityExtract.test.ts",
     "test:benford": "tsx server/benford.test.ts",
+    "sam:sync": "tsx server/samExtractSync.ts all",
+    "sam:sync-exclusions": "tsx server/samExtractSync.ts exclusions",
+    "sam:sync-entities": "tsx server/samExtractSync.ts entities",
+    "sam:publish-data": "tsx server/samPublishData.ts",
     "docker:build": "docker build -t grant-fraud-watch .",
     "docker:run": "docker run --rm -p 3001:3001 --env-file .env grant-fraud-watch"
   },
@@ -23,12 +27,16 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "jszip": "^3.10.1",
+    "yauzl": "^3.4.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
+    "@types/jszip": "^3.4.0",
     "@types/node": "^24.0.15",
+    "@types/yauzl": "^3.4.0",
     "concurrently": "^9.2.0",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3"

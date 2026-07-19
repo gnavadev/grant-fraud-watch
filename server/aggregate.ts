@@ -333,10 +333,8 @@ export async function aggregateAwardsToFacilities(
   // Temporal from transactions
   const txnByRecipient = groupTransactionsByRecipient(transactions);
 
-  // FAC + SAM by UEI. SAM is heavily rate-limited (often daily quota) so we:
-  //  - prefer largest grant recipients first
-  //  - call fewer unique UEIs for SAM than FAC
-  //  - never burst SAM (throttle lives inside fetchSamByUei)
+  // FAC + SAM by UEI.
+  // SAM uses public exclusions extract (1 download/day), so all UEIs are fine.
   type FacData = Awaited<ReturnType<typeof fetchFacByUei>>;
   type SamData = Awaited<ReturnType<typeof fetchSamByUei>>;
   const facByUei = new Map<string, FacData>();
@@ -354,23 +352,20 @@ export async function aggregateAwardsToFacilities(
     ),
   ].slice(0, 40);
 
-  // SAM: only top recipients (quota is tight on free keys)
-  const MAX_SAM_LOOKUPS = 12;
   const samUeis = [
     ...new Set(
       groupsByGrant.map((g) => g.uei).filter((u): u is string => Boolean(u)),
     ),
-  ].slice(0, MAX_SAM_LOOKUPS);
+  ];
 
-  // FAC can run with modest concurrency; SAM is serialized in sam.ts
   await mapPool(facUeis, 2, async (uei) => {
     facByUei.set(uei, await fetchFacByUei(uei));
   });
 
-  // Sequential SAM path (throttle + cache + circuit breaker handle 429s)
-  for (const uei of samUeis) {
+  // Extract-backed SAM lookups are local after one daily download
+  await mapPool(samUeis, 8, async (uei) => {
     samByUei.set(uei, await fetchSamByUei(uei));
-  }
+  });
 
   const facilities: Facility[] = groups.map((m) => {
     // Prefer full recipient grant count (USASpending Grants tab), not sample size

@@ -6,6 +6,8 @@ type Health = {
   samKey?: boolean;
   notes?: string[];
   uptimeSec?: number;
+  samExtractLoaded?: boolean;
+  samExtractCount?: number;
   samQuotaBlocked?: boolean;
   samQuotaUntil?: string | null;
 };
@@ -71,6 +73,7 @@ export function ColdStartBanner() {
     // Key warnings only once ready (no keys set on deploy)
     if (phase === "ready" && health) {
       const showKeys = health.facKey === false || health.samKey === false;
+      // Live Entity API quota only matters if someone enabled SAM_LIVE_FALLBACK
       const showQuota = health.samQuotaBlocked === true;
       if (!showKeys && !showQuota) return null;
 
@@ -80,16 +83,17 @@ export function ColdStartBanner() {
           role="status"
         >
           <p className="font-semibold">
-            {showQuota ? "SAM rate limit" : "API keys incomplete"}
+            {showQuota ? "SAM live API note" : "API keys incomplete"}
           </p>
           <ul className="mt-1 list-disc pl-5 text-amber-900/90">
             {showQuota && (
               <li>
-                SAM.gov daily quota reached
+                SAM.gov live API daily quota reached
                 {health.samQuotaUntil
-                  ? `, lookups are paused until ${new Date(health.samQuotaUntil).toLocaleString()}`
-                  : ", lookups are paused"}
-                . Cached SAM data still works; other scores are unchanged.
+                  ? ` until ${new Date(health.samQuotaUntil).toLocaleString()}`
+                  : ""}
+                . Exclusion checks still use the daily SAM extract (no per-UEI
+                calls).
               </li>
             )}
             {!health.facKey && (

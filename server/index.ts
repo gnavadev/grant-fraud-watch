@@ -10,7 +10,8 @@ import { loadEnv, getFacApiKey, getSamApiKey } from "./env.js";
 import { FACILITY_TYPES, isValidFacilityType } from "./facilityTypes.js";
 import { log } from "./logger.js";
 import { rateLimit } from "./rateLimit.js";
-import { getSamQuotaStatus } from "./sam.js";
+import { getSamExtractStatus, getSamQuotaStatus } from "./sam.js";
+import { getEntityExtractStatus } from "./samEntityExtract.js";
 import type {
   FacilitiesResponse,
   Facility,
@@ -60,17 +61,23 @@ const rescoreLimit = rateLimit({
 app.use(searchLimit);
 app.use(rescoreLimit);
 
-app.get("/api/health", (_req, res) => {
+app.get("/api/health", async (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const facKey = Boolean(getFacApiKey());
   const samKey = Boolean(getSamApiKey());
   const samQuota = getSamQuotaStatus();
+  const samExtract = getSamExtractStatus();
+  const entityExtract = await getEntityExtractStatus();
   res.json({
     ok: true,
     service: "grant-fraud-watch",
     uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000),
     facKey,
     samKey,
+    samExtractLoaded: samExtract.loaded,
+    samExtractCount: samExtract.count,
+    samEntityExtractReady: entityExtract.ready,
+    samEntityExtractCount: entityExtract.count,
     samQuotaBlocked: samQuota.blocked,
     samQuotaUntil: samQuota.until
       ? new Date(samQuota.until).toISOString()
@@ -81,8 +88,16 @@ app.get("/api/health", (_req, res) => {
       !samKey
         ? "SAM_API_KEY not set, SAM enrichment disabled (keys expire ~90 days)"
         : null,
+      samExtract.loaded
+        ? `SAM exclusions extract loaded (${samExtract.count} UEIs)`
+        : samKey
+          ? "SAM exclusions extract not loaded yet (will download on first search)"
+          : null,
+      entityExtract.ready
+        ? `SAM entity extract index ready (${entityExtract.count} UEIs)`
+        : "SAM entity extract not synced (npm run sam:sync-entities) — registration age limited",
       samQuota.blocked
-        ? `SAM daily quota exceeded until ${new Date(samQuota.until!).toISOString()}, using cache only`
+        ? `SAM live API quota exceeded until ${new Date(samQuota.until!).toISOString()} (extract mode still works)`
         : null,
     ].filter(Boolean),
   });

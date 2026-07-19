@@ -10,9 +10,14 @@ client/dist/
 build/
 *.tsbuildinfo
 
-# Local data / runtime cache (API responses, UEI lookups)
+# Local data / runtime cache (API responses, UEI lookups, SAM extracts)
 .cache/
 client/.cache/
+.cache/sam/
+# Optional local copy of large entity DB under data/ (prefer Release in prod)
+data/sam/entities.sqlite
+data/sam/*.zip
+data/sam/*.dat
 tmp/
 temp/
 *.tmp

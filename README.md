@@ -68,9 +68,52 @@ npm start       # node dist/index.js
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `FAC_API_KEY` | Recommended | Data.gov key → FAC `X-Api-Key` |
-| `SAM_API_KEY` | Recommended | SAM Account Details key → `api_key=` |
+| `SAM_API_KEY` | Recommended | SAM Account Details key (extracts + optional live API) |
+| `SAM_LIVE_FALLBACK` | No | Set `1` only to use live Entity API for registration age (burns daily quota) |
 | `PORT` | No | Default `3001` |
 | `NODE_ENV` | No | `production` on deploy |
+
+### SAM without burning quota (prod path)
+
+Free personal SAM keys are often **10 requests/day**. **Do not** call the live
+Entity API per facility in production.
+
+**Architecture:**
+
+```
+GitHub Action (daily/monthly)
+  → SAM extracts API (1–2 GETs)
+  → data/sam/exclusions_ueis.txt  (committed)
+  → Release sam-data-latest / entities.sqlite
+Render / Docker
+  → load exclusions from data/sam (baked in image)
+  → download entities.sqlite from Release once (SAM_ENTITY_DB_URL)
+  → zero SAM API traffic on the web dyno (SAM_DOWNLOAD_EXTRACTS=0)
+```
+
+#### One-time GitHub setup
+
+1. Repo → **Settings → Secrets and variables → Actions**  
+   Add secret **`SAM_API_KEY`** (SAM Account Details key).
+2. **Actions → SAM data sync → Run workflow** → mode **all**.
+3. After it succeeds, set on Render:
+
+```env
+SAM_DOWNLOAD_EXTRACTS=0
+SAM_ENTITY_DB_URL=https://github.com/<you>/<repo>/releases/download/sam-data-latest/entities.sqlite
+```
+
+(Docker already sets `SAM_DOWNLOAD_EXTRACTS=0` and copies `data/`.)
+
+#### Local / manual
+
+```bash
+npm run sam:sync-exclusions   # → .cache
+npm run sam:sync-entities     # → .cache/sam/entities.sqlite (large)
+npm run sam:publish-data      # → data/sam/exclusions_ueis.txt (+ copy sqlite if present)
+```
+
+Live Entity API is **off** unless `SAM_LIVE_FALLBACK=1`. FOUO/SENSITIVE not used.
 
 ## How scoring works (short)
 
