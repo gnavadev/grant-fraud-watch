@@ -15,6 +15,7 @@ client/node_modules
 # Build artifacts (rebuilt in image)
 client/dist
 dist
+server/dist
 .cache
 tmp
 temp

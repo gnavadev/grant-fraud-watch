@@ -3,13 +3,17 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Friendly USAspending grant explorer with Benford's Law fraud heuristics",
+  "description": "USAspending grant explorer with audit-worthiness scoring (FAC, SAM, structure, Benford)",
   "scripts": {
     "dev": "concurrently -n server,client -c blue,green \"npm run dev:server\" \"npm run dev:client\"",
     "dev:server": "tsx watch server/index.ts",
     "dev:client": "npm run dev --prefix client",
-    "build": "npm run build --prefix client",
-    "start": "tsx server/index.ts",
+    "build:client": "npm run build --prefix client",
+    "build:server": "tsc -p tsconfig.json",
+    "build": "npm run build:client && npm run build:server",
+    "start": "node dist/index.js",
+    "start:dev": "tsx server/index.ts",
+    "test": "tsx server/benford.test.ts && tsx server/location.test.ts && tsx server/links.test.ts && tsx server/logger.test.ts",
     "test:benford": "tsx server/benford.test.ts",
     "docker:build": "docker build -t grant-fraud-watch .",
     "docker:run": "docker run --rm -p 3001:3001 --env-file .env grant-fraud-watch"
@@ -19,14 +23,14 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^5.1.0",
-    "tsx": "^4.20.3"
+    "express": "^5.1.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
     "@types/node": "^24.0.15",
     "concurrently": "^9.2.0",
+    "tsx": "^4.20.3",
     "typescript": "^5.8.3"
   }
 }

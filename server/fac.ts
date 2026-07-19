@@ -1,5 +1,6 @@
 import { cacheGet, cacheSet } from "./cache.js";
 import { getFacApiKey } from "./env.js";
+import { log } from "./logger.js";
 
 const FAC_BASE = "https://api.fac.gov";
 
@@ -72,8 +73,7 @@ export async function fetchFacByUei(uei: string): Promise<FacLookup> {
       signal: AbortSignal.timeout(20000),
     });
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.warn("[fac]", clean, res.status, text.slice(0, 200));
+      log.warn("fac_http_error", { uei: clean, status: res.status });
       return { status: "error", message: `FAC HTTP ${res.status}` };
     }
     const rows = (await res.json()) as Record<string, unknown>[];
@@ -144,7 +144,7 @@ export async function fetchFacByUei(uei: string): Promise<FacLookup> {
     await cacheSet(cacheKey, summary);
     return { status: "ok", data: summary };
   } catch (err) {
-    console.warn("[fac] error", clean, err);
+    log.warn("fac_error", { uei: clean, err });
     return {
       status: "error",
       message: err instanceof Error ? err.message : "FAC request failed",

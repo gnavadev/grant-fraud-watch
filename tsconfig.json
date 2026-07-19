@@ -9,8 +9,11 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "outDir": "dist",
-    "rootDir": ".",
-    "types": ["node"]
+    "rootDir": "server",
+    "types": ["node"],
+    "declaration": false,
+    "sourceMap": true
   },
-  "include": ["server/**/*.ts"]
+  "include": ["server/**/*.ts"],
+  "exclude": ["server/**/*.test.ts", "server/benford.test.ts", "node_modules"]
 }

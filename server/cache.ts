@@ -59,6 +59,14 @@ export async function cacheSet<T>(key: string, data: T): Promise<void> {
       "utf8",
     );
   } catch (err) {
-    console.warn("[cache] write failed:", err);
+    // Avoid importing logger cycle; keep quiet-safe
+    console.warn(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "warn",
+        event: "cache_write_failed",
+        err: err instanceof Error ? err.message : String(err),
+      }),
+    );
   }
 }

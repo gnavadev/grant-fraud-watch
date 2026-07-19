@@ -1,5 +1,6 @@
 import { cacheGet, cacheSet } from "./cache.js";
 import { getSamApiKey } from "./env.js";
+import { log } from "./logger.js";
 
 /**
  * SAM.gov Entity Information API (v3).
@@ -77,8 +78,14 @@ export async function fetchSamByUei(uei: string): Promise<SamLookup> {
       signal: AbortSignal.timeout(25000),
     });
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.warn("[sam]", clean, res.status, text.slice(0, 200));
+      log.warn("sam_http_error", { uei: clean, status: res.status });
+      // 401/403 often mean expired SAM Account key (~90 days)
+      if (res.status === 401 || res.status === 403) {
+        return {
+          status: "error",
+          message: `SAM HTTP ${res.status} (key expired or invalid — regenerate on SAM Account Details)`,
+        };
+      }
       return { status: "error", message: `SAM HTTP ${res.status}` };
     }
     const data = (await res.json()) as {
@@ -136,7 +143,7 @@ export async function fetchSamByUei(uei: string): Promise<SamLookup> {
     await cacheSet(cacheKey, summary);
     return { status: "ok", data: summary };
   } catch (err) {
-    console.warn("[sam] error", clean, err);
+    log.warn("sam_error", { uei: clean, err });
     return {
       status: "error",
       message: err instanceof Error ? err.message : "SAM request failed",

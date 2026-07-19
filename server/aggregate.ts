@@ -206,7 +206,8 @@ export async function aggregateAwardsToFacilities(
   const missingUei = groups.filter(
     (g) => !g.uei && g.id && !g.id.startsWith("name:"),
   );
-  await mapPool(missingUei.slice(0, 50), 6, async (g) => {
+  // Free-tier RAM/CPU: modest concurrency for UEI backfill
+  await mapPool(missingUei.slice(0, 40), 4, async (g) => {
     const uei = await fetchUeiForRecipientId(g.id);
     if (uei) g.uei = uei;
   });
@@ -250,7 +251,8 @@ export async function aggregateAwardsToFacilities(
   const facByUei = new Map<string, FacData>();
   const samByUei = new Map<string, SamData>();
 
-  await mapPool(ueiList, 4, async (uei) => {
+  // Cap concurrent FAC+SAM pairs for free-host memory
+  await mapPool(ueiList, 3, async (uei) => {
     const [fac, sam] = await Promise.all([
       fetchFacByUei(uei),
       fetchSamByUei(uei),

@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { ColdStartBanner } from "./components/ColdStartBanner";
 import { EmptyState } from "./components/EmptyState";
 import { FacilitiesTable } from "./components/FacilitiesTable";
 import { FacilityDeepDive } from "./components/FacilityDeepDive";
@@ -158,6 +159,7 @@ export default function App() {
       </header>
 
       <div className="space-y-5">
+        <ColdStartBanner />
         <FilterBar
           value={filters}
           onChange={setFilters}
