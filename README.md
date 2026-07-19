@@ -29,11 +29,14 @@ cp .env.example .env
 npm run dev
 ```
 
+<<<<<<< HEAD
 - **App (Vite):** http://localhost:5173  
 - **API:** http://localhost:3001/api/health  
 
 Production-style locally:
 
+=======
+>>>>>>> 077d527883a1f813e6f19fbe55ebbce9697236c6
 ```bash
 npm run build   # client + compile server → dist/
 npm start       # node dist/index.js
