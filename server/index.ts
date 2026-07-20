@@ -12,7 +12,11 @@ import { FACILITY_TYPES, isValidFacilityType } from "./facilityTypes.js";
 import { log } from "./logger.js";
 import { rateLimit } from "./rateLimit.js";
 import { getSamExtractStatus, getSamQuotaStatus } from "./sam.js";
-import { getEntityExtractStatus } from "./samEntityExtract.js";
+import { ensureSamExclusionsIndex } from "./samExtract.js";
+import {
+  ensureSamEntityIndex,
+  getEntityExtractStatus,
+} from "./samEntityExtract.js";
 import type {
   FacilitiesResponse,
   Facility,
@@ -67,9 +71,25 @@ app.get("/api/health", async (_req, res) => {
   const facKey = Boolean(getFacApiKey());
   const samKey = Boolean(getSamApiKey());
   const samQuota = getSamQuotaStatus();
+  const backend = cacheBackend();
+
+  // Actually load bundled exclusions + entity DB (from data/ or SAM_ENTITY_DB_URL)
+  // so health reflects runtime readiness, not "never touched yet"
+  let exclusions = { ok: false, count: 0, fromCache: false as boolean };
+  try {
+    exclusions = await ensureSamExclusionsIndex();
+  } catch {
+    /* ignore */
+  }
+  let entityReady = false;
+  try {
+    entityReady = await ensureSamEntityIndex();
+  } catch {
+    /* ignore */
+  }
   const samExtract = getSamExtractStatus();
   const entityExtract = await getEntityExtractStatus();
-  const backend = cacheBackend();
+
   res.json({
     ok: true,
     service: "grant-fraud-watch",
@@ -77,10 +97,11 @@ app.get("/api/health", async (_req, res) => {
     facKey,
     samKey,
     cacheBackend: backend,
-    samExtractLoaded: samExtract.loaded,
-    samExtractCount: samExtract.count,
-    samEntityExtractReady: entityExtract.ready,
+    samExtractLoaded: samExtract.loaded && samExtract.count > 0,
+    samExtractCount: samExtract.count || exclusions.count,
+    samEntityExtractReady: entityReady || entityExtract.ready,
     samEntityExtractCount: entityExtract.count,
+    samEntityDbUrl: Boolean(process.env.SAM_ENTITY_DB_URL?.trim()),
     samQuotaBlocked: samQuota.blocked,
     samQuotaUntil: samQuota.until
       ? new Date(samQuota.until).toISOString()
@@ -94,14 +115,14 @@ app.get("/api/health", async (_req, res) => {
       backend === "redis"
         ? "Shared cache: Upstash Redis (survives sleep, shared by all users)"
         : "Cache: local disk only (set UPSTASH_REDIS_REST_URL + TOKEN for shared cache)",
-      samExtract.loaded
-        ? `SAM exclusions extract loaded (${samExtract.count} UEIs)`
-        : samKey
-          ? "SAM exclusions extract not loaded yet (will download on first search)"
-          : null,
-      entityExtract.ready
-        ? `SAM entity extract index ready (${entityExtract.count} UEIs)`
-        : "SAM entity extract not synced (npm run sam:sync-entities), registration age limited",
+      samExtract.loaded && samExtract.count > 0
+        ? `SAM exclusions loaded (${samExtract.count} UEIs, source: ${samExtract.source ?? "unknown"})`
+        : "SAM exclusions not loaded (need data/sam/exclusions_ueis.txt in deploy or allow download)",
+      entityReady || entityExtract.ready
+        ? `SAM entity index ready (${entityExtract.count} rows)`
+        : process.env.SAM_ENTITY_DB_URL?.trim()
+          ? "SAM entity DB URL set but download/open failed (check URL / logs)"
+          : "SAM_ENTITY_DB_URL not set, registration age limited",
       samQuota.blocked
         ? `SAM live API quota exceeded until ${new Date(samQuota.until!).toISOString()} (extract mode still works)`
         : null,
