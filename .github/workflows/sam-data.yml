@@ -109,32 +109,34 @@ jobs:
             git push
           fi
 
-      - name: Check entities.sqlite exists
-        id: entity_db
-        if: steps.mode.outputs.value == 'entities' || steps.mode.outputs.value == 'all'
-        run: |
-          if [ -f .cache/sam/entities.sqlite ] || [ -f data/sam/entities.sqlite ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No entities.sqlite produced (entity sync failed or SAM quota). Skipping release."
-          fi
-
       - name: Publish entities.sqlite Release
-        if: >
-          (steps.mode.outputs.value == 'entities' || steps.mode.outputs.value == 'all')
-          && steps.entity_db.outputs.exists == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: sam-data-latest
-          name: SAM slim data
-          body: |
-            Slim SAM public extract indexes for grant-fraud-watch.
-            Set on Render: SAM_ENTITY_DB_URL to the entities.sqlite asset URL.
-          files: |
-            .cache/sam/entities.sqlite
-            data/sam/entities.sqlite
-          fail_on_unmatched_files: false
+        if: steps.mode.outputs.value == 'entities' || steps.mode.outputs.value == 'all'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          FILE=""
+          if [ -f .cache/sam/entities.sqlite ]; then
+            FILE=.cache/sam/entities.sqlite
+          elif [ -f data/sam/entities.sqlite ]; then
+            FILE=data/sam/entities.sqlite
+          else
+            echo "::warning::No entities.sqlite produced (entity sync failed or SAM quota). Skipping release."
+            exit 0
+          fi
+          echo "Publishing $FILE ($(du -h "$FILE" | cut -f1))"
+          # softprops/action-gh-release often 404s when replacing assets on a reused tag.
+          # gh release upload --clobber is reliable for sam-data-latest.
+          if gh release view sam-data-latest >/dev/null 2>&1; then
+            gh release upload sam-data-latest "$FILE#entities.sqlite" --clobber
+            gh release edit sam-data-latest \
+              --title "SAM slim data" \
+              --notes "Slim SAM public entity index (entities.sqlite). Set Render SAM_ENTITY_DB_URL to this release asset. Updated $(date -u +%Y-%m-%dT%H:%MZ)."
+          else
+            gh release create sam-data-latest "$FILE#entities.sqlite" \
+              --title "SAM slim data" \
+              --notes "Slim SAM public entity index (entities.sqlite). Set Render SAM_ENTITY_DB_URL to this release asset." \
+              --latest=false
+          fi
+          echo "Release URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/sam-data-latest"
 
