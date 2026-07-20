@@ -207,6 +207,11 @@ export interface FacilitiesResponse {
     filters: FacilityFilters;
     disclaimer: string;
     transactionCount?: number;
-    cache?: { awards: boolean; transactions: boolean };
+    cache?: {
+      awards: boolean;
+      transactions: boolean;
+      /** Full /api/facilities response served from Redis/disk */
+      response?: boolean;
+    };
   };
 }

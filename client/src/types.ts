@@ -141,7 +141,11 @@ export interface FacilitiesResponse {
     filters: Partial<FacilityFilters>;
     disclaimer: string;
     transactionCount?: number;
-    cache?: { awards: boolean; transactions: boolean };
+    cache?: {
+      awards: boolean;
+      transactions: boolean;
+      response?: boolean;
+    };
   };
 }
 

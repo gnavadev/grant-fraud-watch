@@ -8,7 +8,7 @@ import type {
 } from "./types.js";
 
 /** Space out recipient-level grant pulls so USAspending is less likely to 429. */
-const recipientThrottle = createThrottle(280);
+const recipientThrottle = createThrottle(120);
 
 const SPENDING_BY_AWARD =
   "https://api.usaspending.gov/api/v2/search/spending_by_award/";

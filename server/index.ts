@@ -6,7 +6,7 @@ import {
   aggregateAwardsToFacilities,
   rescoreFacility,
 } from "./aggregate.js";
-import { cacheBackend } from "./cache.js";
+import { cacheBackend, cacheGet, cacheKey, cacheSet } from "./cache.js";
 import { loadEnv, getFacApiKey, getSamApiKey } from "./env.js";
 import { FACILITY_TYPES, isValidFacilityType } from "./facilityTypes.js";
 import { log } from "./logger.js";
@@ -173,6 +173,34 @@ app.get("/api/facilities", async (req, res) => {
     // Avoid caching personalized search results in shared proxies
     res.setHeader("Cache-Control", "private, no-store");
 
+    // Full response cache (Redis) so CA healthcare etc. is fast for everyone after 1st success
+    const responseCacheKey = cacheKey("facilities_v2", filters);
+    const responseTtl = 6 * 60 * 60 * 1000; // 6 hours
+    const cachedBody = await cacheGet<FacilitiesResponse>(
+      responseCacheKey,
+      responseTtl,
+    );
+    if (cachedBody?.facilities?.length) {
+      log.info("facilities_response_cache_hit", {
+        ms: Date.now() - t0,
+        state: filters.state ?? "",
+        type: filters.type,
+        facilities: cachedBody.facilities.length,
+      });
+      res.json({
+        ...cachedBody,
+        meta: {
+          ...cachedBody.meta,
+          cache: {
+            awards: true,
+            transactions: true,
+            response: true,
+          },
+        },
+      });
+      return;
+    }
+
     const [awardResult, txnResult] = await Promise.all([
       fetchAwards(filters),
       fetchTransactions(filters).catch((err) => {
@@ -206,6 +234,11 @@ app.get("/api/facilities", async (req, res) => {
         },
       },
     };
+
+    // Store full response for shared Redis / disk (best-effort; may be large)
+    void cacheSet(responseCacheKey, body, responseTtl).catch(() => {
+      /* ignore size errors */
+    });
 
     (body.meta as FacilitiesResponse["meta"] & {
       enrichment?: typeof enrichment;
