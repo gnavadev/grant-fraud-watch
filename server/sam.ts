@@ -311,51 +311,81 @@ async function fetchSamLive(
   });
 }
 
+let extractsReadyPromise: Promise<void> | null = null;
+
+/** Load SAM extracts once per process wave (not once per UEI). */
+export async function ensureSamExtractsReady(): Promise<void> {
+  if (!extractsReadyPromise) {
+    extractsReadyPromise = (async () => {
+      await ensureSamExclusionsIndex();
+      await ensureSamEntityIndex();
+    })().catch((err) => {
+      extractsReadyPromise = null;
+      throw err;
+    });
+  }
+  await extractsReadyPromise;
+}
+
+function summaryFromExtracts(clean: string): SamEntitySummary {
+  const extractExcluded = isUeiExcluded(clean);
+  const entityRow = getEntityFromExtract(clean);
+  const excluded = extractExcluded === true;
+  const regDate = entityRow?.registrationDate ?? null;
+  const age = daysSince(regDate);
+  let riskScore = ageRisk(age);
+  if (excluded) riskScore = Math.min(100, riskScore + 85);
+
+  return {
+    uei: clean,
+    found: Boolean(entityRow) || excluded,
+    excluded,
+    exclusionCount: excluded ? 1 : 0,
+    registrationDate: regDate,
+    registrationAgeDays: age,
+    registrationStatus: entityRow?.registrationStatus ?? null,
+    riskScore: Math.min(100, riskScore),
+    legalBusinessName: entityRow?.legalBusinessName ?? null,
+    source: "extract",
+  };
+}
+
 /**
  * Resolve SAM risk for a UEI using exclusions extract first (no per-UEI quota burn).
+ * Extract path is local (no Redis per UEI) so list pages stay fast.
  */
 export async function fetchSamByUei(uei: string): Promise<SamLookup> {
-  const apiKey = getSamApiKey();
-  if (!apiKey || !uei?.trim()) return { status: "skipped" };
+  // API key only required for optional live fallback; extracts work without it
+  if (!uei?.trim()) return { status: "skipped" };
 
   const clean = uei.trim().toUpperCase();
   const cacheKey = `sam_${clean}`;
   const samTtl = 24 * 60 * 60 * 1000;
+
+  // Default path: local extracts only (no live Entity API, no Redis per UEI)
+  if (!liveFallbackEnabled()) {
+    try {
+      await ensureSamExtractsReady();
+      return { status: "ok", data: summaryFromExtracts(clean) };
+    } catch (err) {
+      log.warn("sam_extract_lookup_failed", { uei: clean, err });
+      return {
+        status: "error",
+        message: err instanceof Error ? err.message : "SAM extract failed",
+      };
+    }
+  }
+
+  const apiKey = getSamApiKey();
+  if (!apiKey) return { status: "skipped" };
+
   const cached = await cacheGet<SamEntitySummary>(cacheKey, samTtl);
   if (cached) {
     return { status: "ok", data: { ...cached, source: cached.source ?? "cache" } };
   }
 
-  // Ensure daily exclusions index (1 download/day, not 1/UEI)
-  await ensureSamExclusionsIndex();
-  // Use monthly entity SQLite if present (no download here)
-  await ensureSamEntityIndex();
+  await ensureSamExtractsReady();
   const extractExcluded = isUeiExcluded(clean);
-  const entityRow = getEntityFromExtract(clean);
-
-  // Default path: extracts only (no live Entity API)
-  if (!liveFallbackEnabled()) {
-    const excluded = extractExcluded === true;
-    const regDate = entityRow?.registrationDate ?? null;
-    const age = daysSince(regDate);
-    let riskScore = ageRisk(age);
-    if (excluded) riskScore = Math.min(100, riskScore + 85);
-
-    const summary: SamEntitySummary = {
-      uei: clean,
-      found: Boolean(entityRow) || excluded,
-      excluded,
-      exclusionCount: excluded ? 1 : 0,
-      registrationDate: regDate,
-      registrationAgeDays: age,
-      registrationStatus: entityRow?.registrationStatus ?? null,
-      riskScore: Math.min(100, riskScore),
-      legalBusinessName: entityRow?.legalBusinessName ?? null,
-      source: "extract",
-    };
-    await cacheSet(cacheKey, summary, samTtl);
-    return { status: "ok", data: summary };
-  }
 
   // Optional live enrichment (registration age) when explicitly enabled
   if (Date.now() < samQuotaBlockedUntil) {

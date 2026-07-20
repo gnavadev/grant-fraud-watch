@@ -211,13 +211,21 @@ export interface AggregateResult {
 
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 50;
-/** Full grant hydrate for largest sample-$ orgs on the page; rest keep · sample. */
-const LIST_HYDRATE_TOP = 8;
+/**
+ * Full grant hydrate: only largest sample-$ orgs on the page.
+ * Broad state+type: 0 (sample scores only, · sample label) — list stays under ~15s.
+ * Narrow (city/county/q): top 5 for better counts without crushing latency.
+ */
+const LIST_HYDRATE_TOP_BROAD = 0;
+const LIST_HYDRATE_TOP_NARROW = 5;
+/** FAC light lookups per page (flags only). Rest still score without FAC. */
+const LIST_FAC_TOP_BROAD = 8;
+const LIST_FAC_TOP_NARROW = 12;
 
 /** Free Render proxy ~100s; leave headroom for awards fetch + JSON. */
 function enrichDeadlineMs(): number {
   const n = Number(process.env.ENRICH_BUDGET_MS);
-  return Number.isFinite(n) && n >= 15_000 ? n : 45_000;
+  return Number.isFinite(n) && n >= 10_000 ? n : 25_000;
 }
 
 function sampleGrantTotal(g: MutableFacility): number {
@@ -226,23 +234,24 @@ function sampleGrantTotal(g: MutableFacility): number {
 
 /**
  * Replace sample awards with the recipient's full grant list (last ~10y).
- * Hydrates only the top LIST_HYDRATE_TOP by sample $ (page is already $‑sorted).
+ * Hydrates only the top maxHydrate by sample $ (page is already $‑sorted).
  * Remaining rows stay sample-labeled in the UI.
  */
 async function hydrateFullGrants(
   groups: MutableFacility[],
   deadline: number,
+  maxHydrate: number,
 ): Promise<number> {
-  const targets = groups.slice(0, LIST_HYDRATE_TOP);
+  if (maxHydrate <= 0) return 0;
+  const targets = groups.slice(0, maxHydrate);
   let hydrated = 0;
 
-  await mapPool(targets, 4, async (g) => {
+  await mapPool(targets, 3, async (g) => {
     if (Date.now() > deadline) return;
     try {
       const { awards } = await fetchGrantsForRecipient({
         uei: g.uei,
         name: g.name,
-        // List path: enough pages for true counts on typical orgs
         maxPages: MAX_PAGES_PER_RECIPIENT_LIST,
       });
       if (awards.length === 0) return;
@@ -347,16 +356,20 @@ export async function aggregateAwardsToFacilities(
 
   const deadline = Date.now() + enrichDeadlineMs();
   const broad = isBroadSearch(filters);
+  const hydrateTop = broad ? LIST_HYDRATE_TOP_BROAD : LIST_HYDRATE_TOP_NARROW;
+  const facTop = broad ? LIST_FAC_TOP_BROAD : LIST_FAC_TOP_NARROW;
 
-  // Backfill missing UEIs on this page only (hydrate also fills when present)
-  const missingUei = pageGroups.filter(
-    (g) => !g.uei && g.id && !g.id.startsWith("name:"),
-  );
-  await mapPool(missingUei.slice(0, broad ? 8 : 15), 4, async (g) => {
-    if (Date.now() > deadline) return;
-    const uei = await fetchUeiForRecipientId(g.id);
-    if (uei) g.uei = uei;
-  });
+  // UEI backfill is slow (USAspending profile). Skip on broad — awards usually have UEI.
+  if (!broad) {
+    const missingUei = pageGroups.filter(
+      (g) => !g.uei && g.id && !g.id.startsWith("name:"),
+    );
+    await mapPool(missingUei.slice(0, 10), 4, async (g) => {
+      if (Date.now() > deadline) return;
+      const uei = await fetchUeiForRecipientId(g.id);
+      if (uei) g.uei = uei;
+    });
+  }
 
   type FacData = Awaited<ReturnType<typeof fetchFacByUei>>;
   type SamData = Awaited<ReturnType<typeof fetchSamByUei>>;
@@ -367,44 +380,54 @@ export async function aggregateAwardsToFacilities(
   let subawardRows = 0;
   let grantsHydratedCount = 0;
 
-  const facUeis = () =>
-    [
-      ...new Set(
-        pageGroups.map((g) => g.uei).filter((u): u is string => Boolean(u)),
-      ),
-    ];
+  const pageUeis = [
+    ...new Set(
+      pageGroups.map((g) => g.uei).filter((u): u is string => Boolean(u)),
+    ),
+  ];
+  // FAC only top-N by sample $ (pageGroups already sorted)
+  const facUeis = [
+    ...new Set(
+      pageGroups
+        .slice(0, facTop)
+        .map((g) => g.uei)
+        .filter((u): u is string => Boolean(u)),
+    ),
+  ];
 
-  // Hydrate (top of page) ∥ FAC/SAM (page) ∥ light CFDA — wall clock ≈ max, not sum
+  // Hydrate (optional) ∥ FAC light ∥ SAM local — wall clock ≈ max
   await Promise.all([
     (async () => {
-      grantsHydratedCount = await hydrateFullGrants(pageGroups, deadline);
+      grantsHydratedCount = await hydrateFullGrants(
+        pageGroups,
+        deadline,
+        hydrateTop,
+      );
     })(),
     (async () => {
-      const ueis = facUeis();
-      await Promise.all([
-        mapPool(ueis, 4, async (uei) => {
-          if (Date.now() > deadline) return;
-          // List: one FAC HTTP (flags), not findings detail
-          facByUei.set(
-            uei,
-            await fetchFacByUei(uei, { includeFindings: false }),
-          );
-        }),
-        mapPool(ueis, 10, async (uei) => {
-          samByUei.set(uei, await fetchSamByUei(uei));
-        }),
-      ]);
+      await mapPool(facUeis, 5, async (uei) => {
+        if (Date.now() > deadline) return;
+        facByUei.set(
+          uei,
+          await fetchFacByUei(uei, { includeFindings: false }),
+        );
+      });
     })(),
     (async () => {
-      // Broad: skip CFDA national baselines (secondary signal; deep dive/rescore can add)
+      // Local extracts — fast, no Redis thrash
+      await mapPool(pageUeis, 20, async (uei) => {
+        samByUei.set(uei, await fetchSamByUei(uei));
+      });
+    })(),
+    (async () => {
       if (broad || Date.now() > deadline) return;
       const cfdaNeeded = new Set<string>();
-      for (const g of pageGroups.slice(0, LIST_HYDRATE_TOP)) {
+      for (const g of pageGroups.slice(0, hydrateTop || 5)) {
         const c = primaryCfda(g.cfdaCounts);
         if (c) cfdaNeeded.add(c);
       }
       await Promise.all(
-        [...cfdaNeeded].slice(0, 4).map(async (code) => {
+        [...cfdaNeeded].slice(0, 3).map(async (code) => {
           if (Date.now() > deadline) return;
           baselineMap.set(code, await fetchCfdaBaseline(code));
         }),
@@ -421,22 +444,6 @@ export async function aggregateAwardsToFacilities(
       }
     })(),
   ]);
-
-  // After hydrate, some UEIs may have appeared — fill FAC/SAM for those missing
-  const lateUeis = facUeis().filter((u) => !facByUei.has(u));
-  if (lateUeis.length > 0 && Date.now() < deadline) {
-    await Promise.all([
-      mapPool(lateUeis, 4, async (uei) => {
-        facByUei.set(
-          uei,
-          await fetchFacByUei(uei, { includeFindings: false }),
-        );
-      }),
-      mapPool(lateUeis, 10, async (uei) => {
-        samByUei.set(uei, await fetchSamByUei(uei));
-      }),
-    ]);
-  }
 
   // Temporal from transactions (may be empty on broad searches)
   const txnByRecipient = groupTransactionsByRecipient(transactions);

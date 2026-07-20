@@ -194,6 +194,14 @@ export default function App() {
               <> ({meta.scoredCount} scored)</>
             ) : null}
             .
+            {meta.cache?.response ? (
+              <span className="text-stone-400"> · cached</span>
+            ) : null}
+            {" "}
+            <span className="text-stone-400">
+              Grant counts marked · sample use this search sample (full list on
+              deep dive later).
+            </span>
           </p>
         )}
 

@@ -195,8 +195,8 @@ app.get("/api/facilities", async (req, res) => {
     // Avoid caching personalized search results in shared proxies
     res.setHeader("Cache-Control", "private, no-store");
 
-    // Per-page response cache so CA healthcare page 1/2/... stay fast after first hit
-    const responseCacheKey = `${cacheKey("facilities_v4", filters)}_p${reqPage}_s${pageSize}`;
+    // Per-page response cache (v5: faster list path). First hit fills it.
+    const responseCacheKey = `${cacheKey("facilities_v5", filters)}_p${reqPage}_s${pageSize}`;
     const responseTtl = 6 * 60 * 60 * 1000; // 6 hours
     const cachedBody = await cacheGet<FacilitiesResponse>(
       responseCacheKey,
@@ -228,7 +228,7 @@ app.get("/api/facilities", async (req, res) => {
     const broad = isBroadSearch(filters);
     // Broad CA/type: fewer award pages, skip transactions (temporal is secondary)
     const awardPages = broad ? MAX_PAGES_SEARCH_BROAD : MAX_PAGES_SEARCH;
-    const txnPages = broad ? 0 : Math.min(4, MAX_PAGES_SEARCH);
+    const txnPages = broad ? 0 : Math.min(3, MAX_PAGES_SEARCH);
 
     const [awardResult, txnResult] = await Promise.all([
       fetchAwards(filters, awardPages),
@@ -282,14 +282,16 @@ app.get("/api/facilities", async (req, res) => {
       },
     };
 
-    // Store page response for shared Redis / disk (best-effort)
-    void cacheSet(responseCacheKey, body, responseTtl).catch(() => {
-      /* ignore size errors */
-    });
-
     (body.meta as FacilitiesResponse["meta"] & {
       enrichment?: typeof enrichment;
     }).enrichment = enrichment;
+
+    // Await write so the next user (or retry) hits Redis immediately
+    try {
+      await cacheSet(responseCacheKey, body, responseTtl);
+    } catch {
+      /* best-effort */
+    }
 
     log.info("facilities_ok", {
       ms: Date.now() - t0,
@@ -302,7 +304,9 @@ app.get("/api/facilities", async (req, res) => {
       pageSize: usedPageSize,
       fac: enrichment.facLookups,
       sam: enrichment.samLookups,
+      grantsHydrated: enrichment.grantsHydrated,
       cacheAwards: awardResult.fromCache,
+      msTotal: Date.now() - t0,
     });
 
     res.json(body);
