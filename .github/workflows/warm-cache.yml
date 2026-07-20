@@ -1,0 +1,58 @@
+# Warm popular /api/facilities searches so Redis holds awards, page
+# responses, and facility score-map keys (gfw:sc:v1:...).
+#
+# Setup (optional):
+#   Settings -> Secrets -> Actions -> WARM_BASE_URL
+#   e.g. https://grant-fraud-watch.onrender.com
+#   If unset, defaults to that production URL.
+#
+# Manual: Actions -> Warm cache -> Run workflow
+
+name: Warm cache
+
+on:
+  schedule:
+    # Every 8 hours (UTC)
+    - cron: "20 2,10,18 * * *"
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Base URL to warm (leave empty for secret/default)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Resolve base URL
+        id: base
+        env:
+          SECRET_BASE: ${{ secrets.WARM_BASE_URL }}
+          INPUT_BASE: ${{ github.event.inputs.base_url }}
+        run: |
+          if [ -n "$INPUT_BASE" ]; then
+            echo "url=$INPUT_BASE" >> "$GITHUB_OUTPUT"
+          elif [ -n "$SECRET_BASE" ]; then
+            echo "url=$SECRET_BASE" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=https://grant-fraud-watch.onrender.com" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Warm popular searches
+        env:
+          WARM_BASE_URL: ${{ steps.base.outputs.url }}
+          WARM_TIMEOUT_MS: "180000"
+          WARM_DELAY_MS: "3000"
+        run: node scripts/warm-cache.mjs

@@ -1,0 +1,88 @@
+# Precalculate facility scores into Upstash Redis (score map + page cache).
+# Runs USAspending/FAC from GitHub Actions — does not depend on Render being up.
+#
+# Secrets (Settings -> Secrets -> Actions):
+#   UPSTASH_REDIS_REST_URL
+#   UPSTASH_REDIS_REST_TOKEN
+#   FAC_API_KEY          (recommended)
+#   SAM_API_KEY          (optional)
+#
+# Manual: Actions -> Precalc scores -> Run workflow
+# Optional input: force=true to recompute even when score map already has hits
+
+name: Precalc scores
+
+on:
+  schedule:
+    # Daily 07:30 UTC
+    - cron: "30 7 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force recompute (ignore existing score map)"
+        required: false
+        default: false
+        type: boolean
+      pages:
+        description: "Max pages per filter (empty = universe default)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  precalc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Check Redis secrets
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: |
+          if [ -z "$UPSTASH_REDIS_REST_URL" ] || [ -z "$UPSTASH_REDIS_REST_TOKEN" ]; then
+            echo "::error::Add UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN under Actions secrets (same values as Render)."
+            exit 1
+          fi
+          if [[ "$UPSTASH_REDIS_REST_URL" != https://* ]]; then
+            echo "::error::UPSTASH_REDIS_REST_URL must start with https://"
+            exit 1
+          fi
+          if ! echo "$UPSTASH_REDIS_REST_URL" | grep -q '\.upstash\.io'; then
+            echo "::error::UPSTASH_REDIS_REST_URL must be full host ending in .upstash.io"
+            exit 1
+          fi
+          echo "Redis secrets present"
+
+      - name: Precalc scores into Redis
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          FAC_API_KEY: ${{ secrets.FAC_API_KEY }}
+          SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+          PRECALC: "1"
+          # Bundled exclusions in repo; no live SAM download required
+          SAM_DOWNLOAD_EXTRACTS: "0"
+        run: |
+          EXTRA=""
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            EXTRA="$EXTRA --force"
+          fi
+          PAGES="${{ github.event.inputs.pages }}"
+          if [ -n "$PAGES" ]; then
+            EXTRA="$EXTRA --pages $PAGES"
+          fi
+          echo "Running: npm run scores:precalc -- $EXTRA"
+          npm run scores:precalc -- $EXTRA

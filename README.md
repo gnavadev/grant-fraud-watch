@@ -88,9 +88,40 @@ UPSTASH_REDIS_REST_URL=https://….upstash.io
 UPSTASH_REDIS_REST_TOKEN=…
 ```
 
-4. Redeploy. `/api/health` should show `cacheBackend: "redis"`.
+4. Redeploy. `/api/health` should show `redisOk: true` (and `cacheBackend: "redis"`).
+   The URL must be the full REST host ending in **`.upstash.io`**.
 
 First search for a filter is still slow; the **second** visitor (or retry) for the same filter should be much faster.
+
+### Redis precalc (facility → fraud chance)
+
+Scores for popular state/type filters are stored in Upstash as small keys:
+
+```text
+gfw:sc:v1:<facilityId>   →  { fraudChance, signals, enrichment, fp, … }
+gfw:facilities_v5_…      →  full page JSON (optional, faster first paint)
+gfw:awards_v4_…          →  USAspending award lists
+```
+
+**Local (uses your `.env` Upstash + FAC keys):**
+
+```bash
+npm run scores:precalc
+npm run scores:precalc -- --force              # recompute everything in the universe
+npm run scores:precalc -- --state CA --type healthcare
+npm run scores:precalc -- --pages 1            # first page only (faster test)
+```
+
+**GitHub Action: Precalc scores** (`.github/workflows/precalc-scores.yml`)
+
+- Daily + manual run
+- Secrets: `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, `FAC_API_KEY` (same as Render)
+- Writes **directly to Redis** (does not need Render online)
+- Second run is mostly score-map hits (only new/changed fingerprints get FAC)
+
+**Warm cache** (optional, hits the live site): `npm run warm` / workflow **Warm cache** — good to prime Render’s process; precalc is enough for Redis itself.
+
+After precalc, Upstash Data Browser should list many `gfw:sc:v1:…` keys.
 
 ### SAM without burning quota (prod path)
 

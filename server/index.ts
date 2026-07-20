@@ -10,7 +10,13 @@ import {
   normalizePageOptions,
   rescoreFacility,
 } from "./aggregate.js";
-import { cacheBackend, cacheGet, cacheKey, cacheSet } from "./cache.js";
+import {
+  cacheBackend,
+  cacheGet,
+  cacheKey,
+  cacheSet,
+  probeRedis,
+} from "./cache.js";
 import { loadEnv, getFacApiKey, getSamApiKey } from "./env.js";
 import { FACILITY_TYPES, isValidFacilityType } from "./facilityTypes.js";
 import { log } from "./logger.js";
@@ -81,6 +87,7 @@ app.get("/api/health", async (_req, res) => {
   const samKey = Boolean(getSamApiKey());
   const samQuota = getSamQuotaStatus();
   const backend = cacheBackend();
+  const redisProbe = await probeRedis();
 
   // Actually load bundled exclusions + entity DB (from data/ or SAM_ENTITY_DB_URL)
   // so health reflects runtime readiness, not "never touched yet"
@@ -106,6 +113,11 @@ app.get("/api/health", async (_req, res) => {
     facKey,
     samKey,
     cacheBackend: backend,
+    /** True only if SET+GET against Upstash succeeded (not just env present). */
+    redisOk: redisProbe.ok,
+    redisConfigured: redisProbe.configured,
+    redisLatencyMs: redisProbe.latencyMs ?? null,
+    redisError: redisProbe.error ?? null,
     samExtractLoaded: samExtract.loaded && samExtract.count > 0,
     samExtractCount: samExtract.count || exclusions.count,
     samEntityExtractReady: entityReady || entityExtract.ready,
@@ -121,9 +133,11 @@ app.get("/api/health", async (_req, res) => {
       !samKey
         ? "SAM_API_KEY not set, SAM enrichment disabled (keys expire ~90 days)"
         : null,
-      backend === "redis"
-        ? "Shared cache: Upstash Redis (survives sleep, shared by all users)"
-        : "Cache: local disk only (set UPSTASH_REDIS_REST_URL + TOKEN for shared cache)",
+      redisProbe.ok
+        ? `Shared cache: Upstash Redis OK (${redisProbe.latencyMs ?? "?"}ms)`
+        : redisProbe.configured
+          ? `Upstash configured but not working: ${redisProbe.error ?? "unknown"} (app falls back to disk; Data Browser stays empty)`
+          : "Cache: local disk only (set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN from Upstash REST API)",
       samExtract.loaded && samExtract.count > 0
         ? `SAM exclusions loaded (${samExtract.count} UEIs, source: ${samExtract.source ?? "unknown"})`
         : "SAM exclusions not loaded (need data/sam/exclusions_ueis.txt in deploy or allow download)",
@@ -305,6 +319,7 @@ app.get("/api/facilities", async (req, res) => {
       fac: enrichment.facLookups,
       sam: enrichment.samLookups,
       grantsHydrated: enrichment.grantsHydrated,
+      scoreCacheHits: enrichment.scoreCacheHits,
       cacheAwards: awardResult.fromCache,
       msTotal: Date.now() - t0,
     });

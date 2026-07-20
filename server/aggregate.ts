@@ -9,6 +9,14 @@ import { parseLocation, preferLocation } from "./location.js";
 import { computeMultiSignalScore } from "./multiSignal.js";
 import { fetchSamByUei } from "./sam.js";
 import {
+  applyScoreEntry,
+  facilityToScoreEntry,
+  getFacilityScores,
+  persistFacilityScores,
+  scoreEntryStillValid,
+  setFacilityScore,
+} from "./scoreCache.js";
+import {
   fetchSubawards,
   subawardConcentrationByPrime,
 } from "./subawards.js";
@@ -191,6 +199,10 @@ export interface AggregatePageOptions {
   page?: number;
   /** Facilities per request (default 20, max 50). */
   pageSize?: number;
+  /** Ignore Redis score map and recompute (precalc --force). */
+  skipScoreCache?: boolean;
+  /** Await score map writes (precalc); default fire-and-forget for HTTP. */
+  awaitScoreWrites?: boolean;
 }
 
 export interface AggregateResult {
@@ -206,6 +218,8 @@ export interface AggregateResult {
     samLookups: number;
     subawardRows: number;
     grantsHydrated: number;
+    /** Facilities that reused Redis score map (facility → fraud chance). */
+    scoreCacheHits: number;
   };
 }
 
@@ -359,10 +373,37 @@ export async function aggregateAwardsToFacilities(
   const hydrateTop = broad ? LIST_HYDRATE_TOP_BROAD : LIST_HYDRATE_TOP_NARROW;
   const facTop = broad ? LIST_FAC_TOP_BROAD : LIST_FAC_TOP_NARROW;
 
+  // Load facility → fraud-chance map (small Redis keys, shared across searches)
+  const skipScoreCache = Boolean(pageOpts?.skipScoreCache);
+  const awaitScoreWrites = Boolean(pageOpts?.awaitScoreWrites);
+  const scoreMap = skipScoreCache
+    ? new Map()
+    : await getFacilityScores(pageGroups.map((g) => g.id));
+  const cachedOk = new Set<string>();
+  if (!skipScoreCache) {
+    for (const g of pageGroups) {
+      const entry = scoreMap.get(g.id);
+      if (!entry) continue;
+      const grantReceived = positiveAmounts(g.awardAmounts).reduce(
+        (a, b) => a + b,
+        0,
+      );
+      const awardCount = positiveAmounts(g.awardAmounts).length;
+      if (scoreEntryStillValid(entry, grantReceived, awardCount)) {
+        cachedOk.add(g.id);
+      }
+    }
+  }
+  const scoreCacheHits = cachedOk.size;
+
   // UEI backfill is slow (USAspending profile). Skip on broad — awards usually have UEI.
   if (!broad) {
     const missingUei = pageGroups.filter(
-      (g) => !g.uei && g.id && !g.id.startsWith("name:"),
+      (g) =>
+        !cachedOk.has(g.id) &&
+        !g.uei &&
+        g.id &&
+        !g.id.startsWith("name:"),
     );
     await mapPool(missingUei.slice(0, 10), 4, async (g) => {
       if (Date.now() > deadline) return;
@@ -380,26 +421,27 @@ export async function aggregateAwardsToFacilities(
   let subawardRows = 0;
   let grantsHydratedCount = 0;
 
+  // Only enrich rows without a valid score map hit
+  const needEnrich = pageGroups.filter((g) => !cachedOk.has(g.id));
   const pageUeis = [
     ...new Set(
-      pageGroups.map((g) => g.uei).filter((u): u is string => Boolean(u)),
+      needEnrich.map((g) => g.uei).filter((u): u is string => Boolean(u)),
     ),
   ];
-  // FAC only top-N by sample $ (pageGroups already sorted)
   const facUeis = [
     ...new Set(
-      pageGroups
+      needEnrich
         .slice(0, facTop)
         .map((g) => g.uei)
         .filter((u): u is string => Boolean(u)),
     ),
   ];
 
-  // Hydrate (optional) ∥ FAC light ∥ SAM local — wall clock ≈ max
+  // Hydrate (optional) ∥ FAC light ∥ SAM local — only uncached rows
   await Promise.all([
     (async () => {
       grantsHydratedCount = await hydrateFullGrants(
-        pageGroups,
+        needEnrich,
         deadline,
         hydrateTop,
       );
@@ -414,7 +456,6 @@ export async function aggregateAwardsToFacilities(
       });
     })(),
     (async () => {
-      // Local extracts — fast, no Redis thrash
       await mapPool(pageUeis, 20, async (uei) => {
         samByUei.set(uei, await fetchSamByUei(uei));
       });
@@ -422,7 +463,7 @@ export async function aggregateAwardsToFacilities(
     (async () => {
       if (broad || Date.now() > deadline) return;
       const cfdaNeeded = new Set<string>();
-      for (const g of pageGroups.slice(0, hydrateTop || 5)) {
+      for (const g of needEnrich.slice(0, hydrateTop || 5)) {
         const c = primaryCfda(g.cfdaCounts);
         if (c) cfdaNeeded.add(c);
       }
@@ -459,9 +500,54 @@ export async function aggregateAwardsToFacilities(
       0,
     );
     const cfda = primaryCfda(m.cfdaCounts);
-    const baseline = cfda ? (baselineMap.get(cfda) ?? null) : null;
     const types = [...m.awardTypes];
+    const features = extractAmountFeatures(m.scoreAmounts);
+    const benfordDetail = scoreAmountsWithBenford(m.scoreAmounts);
 
+    // Fast path: facility → fraud chance map hit
+    const cached = scoreMap.get(m.id);
+    if (cached && cachedOk.has(m.id)) {
+      const base: Facility = {
+        id: m.id,
+        name: m.name,
+        city: m.city,
+        county: m.county,
+        state: m.state,
+        grantReceived,
+        awardCount,
+        grantsHydrated: m.grantsHydrated || cached.grantsHydrated,
+        sampleCount: features.n,
+        fraudChance: cached.fraudChance,
+        fraudLabel: cached.fraudLabel,
+        confidence: cached.confidence,
+        scoreMethod: cached.scoreMethod,
+        scoreStatus: "ok",
+        benfordScore: cached.benfordScore,
+        multiScore: cached.multiScore,
+        signals: cached.signals,
+        avgAward: cached.avgAward ?? (awardCount ? grantReceived / awardCount : null),
+        primaryCfda: cfda ?? cached.primaryCfda,
+        awardTypes: types,
+        uei: m.uei ?? cached.uei,
+        recipientId: m.id.startsWith("name:") ? null : m.id,
+        benfordEligible: features.n >= 3,
+        enrichment: cached.enrichment,
+        rescore: {
+          scoreAmounts: m.scoreAmounts,
+          awardTypes: types,
+          usedTransactions: m.usedTransactions,
+          primaryCfda: cfda ?? cached.primaryCfda ?? null,
+          grantReceived,
+          awardCount,
+        },
+        benford: benfordDetail.benford,
+        features,
+        deepScored: m.usedTransactions,
+      };
+      return applyScoreEntry(base, cached);
+    }
+
+    const baseline = cfda ? (baselineMap.get(cfda) ?? null) : null;
     const facLookup = m.uei ? facByUei.get(m.uei) : undefined;
     const samLookup = m.uei ? samByUei.get(m.uei) : undefined;
     const fac = facLookup?.status === "ok" ? facLookup.data : null;
@@ -479,9 +565,6 @@ export async function aggregateAwardsToFacilities(
     const txns = txnByRecipient.get(m.id) ?? [];
     const temporal =
       txns.length > 0 ? temporalRiskFromTransactions(m.id, txns) : null;
-
-    const features = extractAmountFeatures(m.scoreAmounts);
-    const benfordDetail = scoreAmountsWithBenford(m.scoreAmounts);
 
     const multi = computeMultiSignalScore({
       scoreAmounts: m.scoreAmounts,
@@ -573,6 +656,20 @@ export async function aggregateAwardsToFacilities(
     };
   });
 
+  // Persist facility → fraud chance (small keys for Upstash)
+  const toWrite = facilities.filter(
+    (f) => f.scoreStatus === "ok" && (skipScoreCache || !cachedOk.has(f.id)),
+  );
+  if (toWrite.length > 0) {
+    if (awaitScoreWrites) {
+      await persistFacilityScores(toWrite);
+    } else {
+      void persistFacilityScores(toWrite).catch(() => {
+        /* ignore */
+      });
+    }
+  }
+
   // Within this page: fraud chance first, then dollars
   facilities.sort((a, b) => {
     const fa = a.fraudChance ?? -1;
@@ -593,6 +690,7 @@ export async function aggregateAwardsToFacilities(
       samLookups: samByUei.size,
       subawardRows,
       grantsHydrated: grantsHydratedCount,
+      scoreCacheHits,
     },
   };
 }
@@ -670,7 +768,7 @@ export async function rescoreFacility(input: {
 
   // After a retry attempt we always settle: show score (or N/A), never keep spinning.
   // Partial enrichment (e.g. SAM down) is fine, score without that data.
-  return {
+  const updated: Facility = {
     ...f,
     fraudChance: multi.multiScore,
     fraudLabel: fraudLabelFromChance(multi.multiScore),
@@ -711,4 +809,6 @@ export async function rescoreFacility(input: {
     benford: benfordDetail.benford,
     features,
   };
+  void setFacilityScore(facilityToScoreEntry(updated)).catch(() => {});
+  return updated;
 }

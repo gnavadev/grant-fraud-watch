@@ -18,16 +18,51 @@ type CacheEnvelope<T> = { savedAt: number; data: T; ttlMs: number };
 
 let redis: Redis | null | undefined;
 
+function redisConfig(): { url: string; token: string } | null {
+  const url = (process.env.UPSTASH_REDIS_REST_URL ?? "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
+  const token = (process.env.UPSTASH_REDIS_REST_TOKEN ?? "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
+  if (!url || !token) return null;
+  // Must be REST HTTPS endpoint from Upstash "REST API" section, not redis://
+  if (!/^https:\/\//i.test(url)) {
+    console.warn(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "warn",
+        event: "redis_bad_url",
+        hint: "UPSTASH_REDIS_REST_URL must start with https:// (use REST URL, not redis://)",
+      }),
+    );
+    return null;
+  }
+  // Common paste error: truncated host (…upstash.i instead of …upstash.io)
+  if (!/\.upstash\.io\/?$/i.test(url) && !/\.upstash\.io\//i.test(url)) {
+    console.warn(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "warn",
+        event: "redis_url_looks_truncated",
+        hint: "URL should look like https://xxxxx.upstash.io (full host, ends with .io)",
+        urlHost: url.slice(0, 48),
+      }),
+    );
+    // Still try — some enterprise hosts differ — but probe will fail if broken
+  }
+  return { url, token };
+}
+
 /**
  * Shared Upstash Redis when UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are set.
  * Falls back to local disk so local dev keeps working without Redis.
  */
 export function getRedis(): Redis | null {
   if (redis !== undefined) return redis;
-  const url = process.env.UPSTASH_REDIS_REST_URL?.trim();
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
-  if (url && token) {
-    redis = new Redis({ url, token });
+  const cfg = redisConfig();
+  if (cfg) {
+    redis = new Redis({ url: cfg.url, token: cfg.token });
   } else {
     redis = null;
   }
@@ -36,6 +71,46 @@ export function getRedis(): Redis | null {
 
 export function cacheBackend(): "redis" | "disk" {
   return getRedis() ? "redis" : "disk";
+}
+
+export type RedisProbe = {
+  configured: boolean;
+  ok: boolean;
+  error?: string;
+  latencyMs?: number;
+};
+
+/**
+ * Real SET+GET against Upstash. Use in /api/health so "redis" means working, not just env set.
+ */
+export async function probeRedis(): Promise<RedisProbe> {
+  const r = getRedis();
+  if (!r) {
+    return { configured: false, ok: false, error: "UPSTASH env not set or URL not https://" };
+  }
+  const t0 = Date.now();
+  const key = `${KEY_PREFIX}__health_ping`;
+  try {
+    await r.set(key, { t: t0, ok: true }, { ex: 120 });
+    const got = (await r.get(key)) as { t?: number; ok?: boolean } | null;
+    const latencyMs = Date.now() - t0;
+    if (!got || got.ok !== true) {
+      return {
+        configured: true,
+        ok: false,
+        latencyMs,
+        error: "SET ok but GET returned empty/mismatch (check REST token read+write)",
+      };
+    }
+    return { configured: true, ok: true, latencyMs };
+  } catch (err) {
+    return {
+      configured: true,
+      ok: false,
+      latencyMs: Date.now() - t0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 export function cacheKey(kind: string, filters: FacilityFilters): string {
