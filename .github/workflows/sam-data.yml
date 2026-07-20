@@ -1,25 +1,19 @@
-# Build slim SAM indexes without burning Render runtime or live Entity API quota.
+# Build slim SAM indexes. Fails if exclusions download returns empty
+# (missing secret or SAM 429 quota) so we never commit empty data.
 #
 # Setup:
-#   1. GitHub → Settings → Secrets and variables → Actions → New secret
-#      Name: SAM_API_KEY  Value: your SAM Account Details key
-#   2. Actions → SAM data sync → Run workflow → mode: all
+#   Settings → Secrets and variables → Actions → SAM_API_KEY
+#   Actions → SAM data sync → Run workflow → mode: all
 #
-# Outputs:
-#   - data/sam/exclusions_ueis.txt  (committed daily)
-#   - Release tag sam-data-latest / entities.sqlite  (monthly)
-#
-# Render env (optional):
+# Render:
+#   SAM_DOWNLOAD_EXTRACTS=0
 #   SAM_ENTITY_DB_URL=https://github.com/<owner>/<repo>/releases/download/sam-data-latest/entities.sqlite
-#   SAM_DOWNLOAD_EXTRACTS=0   # never hit SAM from the web dyno
 
 name: SAM data sync
 
 on:
   schedule:
-    # Daily exclusions (08:15 UTC)
     - cron: "15 8 * * *"
-    # Monthly entities (2nd of month 09:00 UTC, after typical 1st-Sunday publish)
     - cron: "0 9 2 * *"
   workflow_dispatch:
     inputs:
@@ -61,58 +55,86 @@ jobs:
             echo "value=exclusions" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check SAM_API_KEY secret
+        env:
+          SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+        run: |
+          if [ -z "$SAM_API_KEY" ]; then
+            echo "::error::Secret SAM_API_KEY is empty. Add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          echo "SAM_API_KEY is set (length ${#SAM_API_KEY})"
+
       - name: Sync exclusions extract
         if: steps.mode.outputs.value == 'exclusions' || steps.mode.outputs.value == 'all'
         env:
           SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+          CI: "true"
+          SAM_FORCE_DOWNLOAD: "1"
         run: npm run sam:sync-exclusions
-        continue-on-error: true
 
       - name: Sync monthly entity extract → SQLite
         if: steps.mode.outputs.value == 'entities' || steps.mode.outputs.value == 'all'
         env:
           SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+          CI: "true"
+          SAM_FORCE_DOWNLOAD: "1"
         run: npm run sam:sync-entities -- --force
-        continue-on-error: true
 
-      - name: Write data/sam/exclusions_ueis.txt
+      - name: Write data/sam/exclusions_ueis.txt (fail if empty)
         if: steps.mode.outputs.value == 'exclusions' || steps.mode.outputs.value == 'all'
         env:
           SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+          CI: "true"
+          SAM_FORCE_DOWNLOAD: "1"
         run: npm run sam:publish-data
-        continue-on-error: true
 
       - name: Commit exclusions list
         if: steps.mode.outputs.value == 'exclusions' || steps.mode.outputs.value == 'all'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Only commit if we actually have UEIs (not just comments)
+          COUNT=$(grep -cE '^[A-Z0-9]{12}$' data/sam/exclusions_ueis.txt || true)
+          echo "UEI lines in file: $COUNT"
+          if [ "$COUNT" -lt 1 ]; then
+            echo "::error::exclusions_ueis.txt has no UEIs, refusing to commit empty data"
+            exit 1
+          fi
           git add data/sam/exclusions_ueis.txt
           if git diff --staged --quiet; then
             echo "No exclusions file changes"
           else
-            git commit -m "chore(sam): refresh public exclusions UEI list"
+            git commit -m "chore(sam): refresh public exclusions UEI list ($COUNT UEIs)"
             git push
           fi
 
-      - name: Publish entities.sqlite Release
+      - name: Check entities.sqlite exists
+        id: entity_db
         if: steps.mode.outputs.value == 'entities' || steps.mode.outputs.value == 'all'
+        run: |
+          if [ -f .cache/sam/entities.sqlite ] || [ -f data/sam/entities.sqlite ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No entities.sqlite produced (entity sync failed or SAM quota). Skipping release."
+          fi
+
+      - name: Publish entities.sqlite Release
+        if: >
+          (steps.mode.outputs.value == 'entities' || steps.mode.outputs.value == 'all')
+          && steps.entity_db.outputs.exists == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: sam-data-latest
           name: SAM slim data
           body: |
-            Slim SAM **public** extract indexes for grant-fraud-watch.
-
-            | Asset | Contents |
-            |-------|----------|
-            | `entities.sqlite` | UEI → registration date, status, legal name |
-
-            Built from SAM PUBLIC monthly entity extract (pipe-delimited V2).
-            Set on Render: `SAM_ENTITY_DB_URL` to this asset URL.
+            Slim SAM public extract indexes for grant-fraud-watch.
+            Set on Render: SAM_ENTITY_DB_URL to the entities.sqlite asset URL.
           files: |
             .cache/sam/entities.sqlite
             data/sam/entities.sqlite
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

@@ -244,14 +244,22 @@ async function downloadExclusionsExtract(): Promise<ExclusionsIndex | null> {
 
 /**
  * Ensure exclusions UEI set is in memory (download at most ~1×/day).
+ *
+ * Load order:
+ *  1) Fresh .cache JSON
+ *  2) If CI / SAM_FORCE_DOWNLOAD=1 → hit SAM API (do not treat empty data/ as success)
+ *  3) Bundled data/sam/exclusions_ueis.txt (must contain real UEIs)
+ *  4) Stale cache
+ *  5) Download (unless SAM_DOWNLOAD_EXTRACTS=0)
  */
 export async function ensureSamExclusionsIndex(): Promise<{
   ok: boolean;
   count: number;
   fromCache: boolean;
   ageHours: number | null;
+  error?: string;
 }> {
-  if (memorySet && memoryMeta) {
+  if (memorySet && memoryMeta && memorySet.size > 0) {
     const age = Date.now() - memoryMeta.downloadedAt;
     if (age <= EXCLUSIONS_TTL_MS) {
       return {
@@ -265,28 +273,56 @@ export async function ensureSamExclusionsIndex(): Promise<{
 
   if (!loadPromise) {
     loadPromise = (async () => {
-      // 1) Fresh runtime cache
-      const fresh = await loadIndexFromDisk();
-      if (fresh && memorySet) return;
+      const forceDownload =
+        process.env.CI === "true" ||
+        process.env.SAM_FORCE_DOWNLOAD === "1" ||
+        process.env.SAM_FORCE_DOWNLOAD === "true";
 
-      // 2) Bundled data/sam/exclusions_ueis.txt (repo / Docker, no SAM call)
+      const hasKey = Boolean(getSamApiKey());
+      log.info("sam_exclusions_ensure", {
+        hasKey,
+        forceDownload,
+        downloadDisabled: process.env.SAM_DOWNLOAD_EXTRACTS === "0",
+      });
+
+      // 1) Fresh runtime cache with data
+      const fresh = await loadIndexFromDisk();
+      if (fresh && memorySet && memorySet.size > 0) return;
+
+      // 2) CI / force: download first (empty bundle must not short-circuit)
+      if (
+        forceDownload &&
+        hasKey &&
+        process.env.SAM_DOWNLOAD_EXTRACTS !== "0"
+      ) {
+        const downloaded = await downloadExclusionsExtract();
+        if (downloaded && memorySet && memorySet.size > 0) return;
+      }
+
+      // 3) Bundled data/sam (prod image / repo) — only if non-empty
       if (await loadBundledExclusions()) return;
 
-      // 3) Stale cache still usable if present
+      // 4) Stale cache still usable
       if (memorySet && memorySet.size > 0) return;
 
-      // 4) Optional one download (dev / when bundle missing)
+      // 5) Optional download for local/dev
       if (process.env.SAM_DOWNLOAD_EXTRACTS === "0") {
         log.info("sam_exclusions_download_skipped", {
           reason: "SAM_DOWNLOAD_EXTRACTS=0",
         });
         return;
       }
-      const downloaded = await downloadExclusionsExtract();
-      if (!downloaded) {
-        if (!memorySet) await loadIndexFromDisk();
-        if (!memorySet) await loadBundledExclusions();
+      if (hasKey) {
+        const downloaded = await downloadExclusionsExtract();
+        if (downloaded && memorySet && memorySet.size > 0) return;
+      } else {
+        log.warn("sam_exclusions_no_api_key", {
+          hint: "Set SAM_API_KEY env or GitHub secret SAM_API_KEY",
+        });
       }
+
+      if (!memorySet) await loadIndexFromDisk();
+      if (!memorySet || memorySet.size === 0) await loadBundledExclusions();
     })().finally(() => {
       loadPromise = null;
     });
@@ -294,8 +330,16 @@ export async function ensureSamExclusionsIndex(): Promise<{
 
   await loadPromise;
 
-  if (!memorySet) {
-    return { ok: false, count: 0, fromCache: false, ageHours: null };
+  if (!memorySet || memorySet.size === 0) {
+    return {
+      ok: false,
+      count: 0,
+      fromCache: false,
+      ageHours: null,
+      error: getSamApiKey()
+        ? "SAM exclusions download returned no UEIs (quota 429, bad key, or parse failed). Check Action logs for sam_extract_download_failed."
+        : "SAM_API_KEY is missing. Add repo secret SAM_API_KEY (Actions → Settings → Secrets).",
+    };
   }
   const age = memoryMeta ? Date.now() - memoryMeta.downloadedAt : 0;
   return {
@@ -304,6 +348,10 @@ export async function ensureSamExclusionsIndex(): Promise<{
     fromCache: age > 0 && age <= EXCLUSIONS_TTL_MS,
     ageHours: Math.round((age / 3600000) * 10) / 10,
   };
+}
+
+export function getExcludedUeis(): string[] {
+  return memorySet ? [...memorySet] : [];
 }
 
 export function isUeiExcluded(uei: string): boolean | null {

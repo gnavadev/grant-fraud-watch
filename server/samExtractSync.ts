@@ -20,9 +20,21 @@ import {
 
 loadEnv();
 
+// Prefer live download in CI / explicit sync (empty data/ must not win)
+if (process.env.CI === "true" || process.argv.includes("--force")) {
+  process.env.SAM_FORCE_DOWNLOAD = process.env.SAM_FORCE_DOWNLOAD ?? "1";
+}
+
 const mode = (process.argv[2] ?? "all").toLowerCase();
 
 async function syncExclusions() {
+  console.log(
+    JSON.stringify({
+      hasSamKey: Boolean(process.env.SAM_API_KEY?.trim()),
+      forceDownload: process.env.SAM_FORCE_DOWNLOAD,
+      ci: process.env.CI,
+    }),
+  );
   const result = await ensureSamExclusionsIndex();
   const status = getSamExtractStatus();
   console.log(
@@ -35,12 +47,17 @@ async function syncExclusions() {
         count: status.count || result.count,
         downloadedAt: status.downloadedAt,
         source: status.source,
+        error: result.error,
       },
       null,
       2,
     ),
   );
-  return result.ok;
+  if (!result.ok || (status.count || result.count) < 1) {
+    console.error(result.error ?? "Exclusions sync produced 0 UEIs");
+    return false;
+  }
+  return true;
 }
 
 async function syncEntities() {
