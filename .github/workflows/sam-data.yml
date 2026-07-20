@@ -74,12 +74,21 @@ jobs:
         run: npm run sam:sync-exclusions
 
       - name: Sync monthly entity extract → SQLite
+        id: entity_sync
         if: steps.mode.outputs.value == 'entities' || steps.mode.outputs.value == 'all'
         env:
           SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
           CI: "true"
           SAM_FORCE_DOWNLOAD: "1"
-        run: npm run sam:sync-entities -- --force
+        run: |
+          set -e
+          npm run sam:sync-entities -- --force
+          if [ ! -f .cache/sam/entities.sqlite ]; then
+            echo "::error::entities.sqlite missing after sync. Open this step's log for sam_entity_download_failed / parse errors."
+            ls -la .cache/sam/ || true
+            exit 1
+          fi
+          ls -lh .cache/sam/entities.sqlite
 
       - name: Write data/sam/exclusions_ueis.txt (fail if empty)
         if: steps.mode.outputs.value == 'exclusions' || steps.mode.outputs.value == 'all'
@@ -115,18 +124,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          FILE=""
-          if [ -f .cache/sam/entities.sqlite ]; then
-            FILE=.cache/sam/entities.sqlite
-          elif [ -f data/sam/entities.sqlite ]; then
-            FILE=data/sam/entities.sqlite
-          else
-            echo "::warning::No entities.sqlite produced (entity sync failed or SAM quota). Skipping release."
-            exit 0
+          FILE=".cache/sam/entities.sqlite"
+          if [ ! -f "$FILE" ]; then
+            FILE="data/sam/entities.sqlite"
+          fi
+          if [ ! -f "$FILE" ]; then
+            echo "::error::No entities.sqlite to publish. Entity sync step must succeed first."
+            exit 1
           fi
           echo "Publishing $FILE ($(du -h "$FILE" | cut -f1))"
-          # softprops/action-gh-release often 404s when replacing assets on a reused tag.
-          # gh release upload --clobber is reliable for sam-data-latest.
+          # Reuse tag sam-data-latest; --clobber replaces the asset
           if gh release view sam-data-latest >/dev/null 2>&1; then
             gh release upload sam-data-latest "$FILE#entities.sqlite" --clobber
             gh release edit sam-data-latest \

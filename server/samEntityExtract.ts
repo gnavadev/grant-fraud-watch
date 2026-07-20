@@ -103,7 +103,8 @@ async function ensureDir(): Promise<void> {
 
 function openDb(readonly = false): DatabaseSync {
   if (db && !readonly) return db;
-  ENTITY_DB = resolveEntityDbPath();
+  // Writes always go to cache; reads prefer bundled then cache
+  ENTITY_DB = readonly ? resolveEntityDbPath() : cacheEntityDbPath();
   const database = new DatabaseSync(ENTITY_DB, { readOnly: readonly });
   if (!readonly) {
     database.exec(`
@@ -247,7 +248,12 @@ function extractZipEntryToFile(
         reject(err ?? new Error("zip open failed"));
         return;
       }
-      let found = false;
+      let settled = false;
+      const done = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        fn();
+      };
       zipfile.readEntry();
       zipfile.on("entry", (entry) => {
         const name = entry.fileName;
@@ -260,31 +266,32 @@ function extractZipEntryToFile(
           zipfile.readEntry();
           return;
         }
-        found = true;
         zipfile.openReadStream(entry, (e2, readStream) => {
           if (e2 || !readStream) {
-            reject(e2 ?? new Error("zip stream failed"));
+            done(() => reject(e2 ?? new Error("zip stream failed")));
             return;
           }
           const out = createWriteStream(destPath);
           readStream.pipe(out);
-          out.on("finish", () => resolve(name));
-          out.on("error", reject);
-          readStream.on("error", reject);
+          out.on("finish", () => done(() => resolve(name)));
+          out.on("error", (e) => done(() => reject(e)));
+          readStream.on("error", (e) => done(() => reject(e)));
         });
       });
       zipfile.on("end", () => {
-        if (!found) reject(new Error("No .dat/.csv entry in entity ZIP"));
+        done(() => reject(new Error("No .dat/.csv entry in entity ZIP")));
       });
-      zipfile.on("error", reject);
+      zipfile.on("error", (e) => done(() => reject(e)));
     });
   });
 }
 
 async function streamDownload(url: string, destPath: string): Promise<void> {
+  // Follow redirects (SAM extracts often 302 → S3), same as curl -L
   const res = await fetch(url, {
     headers: { Accept: "application/zip, application/octet-stream, */*" },
     signal: AbortSignal.timeout(600_000),
+    redirect: "follow",
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -294,11 +301,13 @@ async function streamDownload(url: string, destPath: string): Promise<void> {
 
   const file = createWriteStream(destPath);
   const reader = res.body.getReader();
+  let bytes = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       if (value) {
+        bytes += value.byteLength;
         if (!file.write(Buffer.from(value))) {
           await new Promise<void>((r) => file.once("drain", () => r()));
         }
@@ -311,10 +320,52 @@ async function streamDownload(url: string, destPath: string): Promise<void> {
   } finally {
     reader.releaseLock();
   }
+  if (bytes < 1000) {
+    throw new Error(
+      `Download too small (${bytes} bytes). Likely redirect/HTML error, not a ZIP.`,
+    );
+  }
+  log.info("sam_entity_download_bytes", { bytes, destPath });
+}
+
+/** Candidate extract URLs (monthly file may lag; try current + previous month). */
+function entityExtractUrls(apiKey: string, preferredDate?: string): string[] {
+  const urls: string[] = [];
+  const now = new Date();
+  const months: string[] = [];
+  if (preferredDate) months.push(preferredDate);
+  for (let i = 0; i < 3; i++) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const yyyy = d.getUTCFullYear();
+    const key = `${mm}/${yyyy}`;
+    if (!months.includes(key)) months.push(key);
+  }
+  for (const dateParam of months) {
+    urls.push(
+      `https://api.sam.gov/data-services/v1/extracts` +
+        `?api_key=${encodeURIComponent(apiKey)}` +
+        `&fileType=ENTITY` +
+        `&sensitivity=PUBLIC` +
+        `&frequency=MONTHLY` +
+        `&date=${encodeURIComponent(dateParam)}`,
+    );
+  }
+  // UTF-8 monthly without date (latest)
+  urls.push(
+    `https://api.sam.gov/data-services/v1/extracts` +
+      `?api_key=${encodeURIComponent(apiKey)}` +
+      `&fileType=ENTITY` +
+      `&sensitivity=PUBLIC` +
+      `&frequency=MONTHLY` +
+      `&charset=UTF8`,
+  );
+  return urls;
 }
 
 async function buildSqliteFromDat(datPath: string, source: string): Promise<number> {
-  // Rebuild DB cleanly
+  // Always write the runtime cache DB path (not a missing bundled path)
+  ENTITY_DB = cacheEntityDbPath();
   try {
     await fs.unlink(ENTITY_DB);
   } catch {
@@ -391,26 +442,27 @@ export async function syncSamEntityExtract(options?: {
     return { ok: false, count: 0, source: null, error: "SAM_API_KEY not set" };
   }
 
-  const now = new Date();
-  const dateParam =
-    options?.date ??
-    `${String(now.getUTCMonth() + 1).padStart(2, "0")}/${now.getUTCFullYear()}`;
+  const urls = entityExtractUrls(apiKey, options?.date);
+  log.info("sam_entity_download_start", { candidates: urls.length });
 
-  const url =
-    `https://api.sam.gov/data-services/v1/extracts` +
-    `?api_key=${encodeURIComponent(apiKey)}` +
-    `&fileType=ENTITY` +
-    `&sensitivity=PUBLIC` +
-    `&frequency=MONTHLY` +
-    `&date=${encodeURIComponent(dateParam)}`;
+  let downloadError = "unknown";
+  let downloaded = false;
+  for (const url of urls) {
+    try {
+      // Log URL without api_key
+      log.info("sam_entity_try_url", {
+        url: url.replace(/api_key=[^&]+/, "api_key=***"),
+      });
+      await streamDownload(url, ENTITY_ZIP);
+      downloaded = true;
+      break;
+    } catch (err) {
+      downloadError = err instanceof Error ? err.message : String(err);
+      log.warn("sam_entity_download_failed", { err: downloadError });
+    }
+  }
 
-  log.info("sam_entity_download_start", { date: dateParam });
-
-  try {
-    await streamDownload(url, ENTITY_ZIP);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log.warn("sam_entity_download_failed", { err: msg });
+  if (!downloaded) {
     // Manual bootstrap: place entity_manual.zip in .cache/sam/
     try {
       await fs.access(path.join(SAM_CACHE_DIR, "entity_manual.zip"));
@@ -419,8 +471,14 @@ export async function syncSamEntityExtract(options?: {
         ENTITY_ZIP,
       );
       log.info("sam_entity_using_manual_zip");
+      downloaded = true;
     } catch {
-      return { ok: false, count: 0, source: null, error: msg };
+      return {
+        ok: false,
+        count: 0,
+        source: null,
+        error: `Entity extract download failed: ${downloadError}. Try: curl -sL -o .cache/sam/entity_manual.zip "…fileType=ENTITY&sensitivity=PUBLIC&frequency=MONTHLY&date=MM/YYYY" then npm run sam:sync-entities -- --force`,
+      };
     }
   }
 
