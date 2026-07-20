@@ -92,6 +92,29 @@ async function diskSet<T>(
   await fs.writeFile(file, JSON.stringify(envelope), "utf8");
 }
 
+/** Avoid flooding Render logs when Upstash is flaky (rate limit / network). */
+let redisFailLogAt = 0;
+let redisFailCount = 0;
+
+function logRedisFail(event: string, key: string, err: unknown): void {
+  redisFailCount += 1;
+  const now = Date.now();
+  // Log first failure immediately, then at most once per 30s with count
+  if (now - redisFailLogAt < 30_000 && redisFailCount > 1) return;
+  redisFailLogAt = now;
+  console.warn(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      level: "warn",
+      event,
+      key,
+      err: err instanceof Error ? err.message : String(err),
+      recentFails: redisFailCount,
+    }),
+  );
+  redisFailCount = 0;
+}
+
 async function redisGet<T>(key: string, ttlMs: number): Promise<T | null> {
   const r = getRedis();
   if (!r) return null;
@@ -102,15 +125,7 @@ async function redisGet<T>(key: string, ttlMs: number): Promise<T | null> {
     if (Date.now() - parsed.savedAt > ttlMs) return null;
     return parsed.data;
   } catch (err) {
-    console.warn(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        level: "warn",
-        event: "redis_get_failed",
-        key,
-        err: err instanceof Error ? err.message : String(err),
-      }),
-    );
+    logRedisFail("redis_get_failed", key, err);
     return null;
   }
 }
@@ -131,15 +146,7 @@ async function redisSet<T>(
     const exSec = Math.max(60, Math.ceil(ttlMs / 1000));
     await r.set(redisKey(key), envelope, { ex: exSec });
   } catch (err) {
-    console.warn(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        level: "warn",
-        event: "redis_set_failed",
-        key,
-        err: err instanceof Error ? err.message : String(err),
-      }),
-    );
+    logRedisFail("redis_set_failed", key, err);
   }
 }
 

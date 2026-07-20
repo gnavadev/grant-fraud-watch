@@ -17,7 +17,7 @@ const initialFilters: FacilityFilters = {
 
 export default function App() {
   const [filters, setFilters] = useState<FacilityFilters>(initialFilters);
-  const { facilities, meta, loading, error, searched, search } =
+  const { facilities, meta, loading, error, searched, search, goToPage } =
     useFacilities();
   const [helpOpen, setHelpOpen] = useState(false);
   const [hideInsufficient, setHideInsufficient] = useState(false);
@@ -30,7 +30,12 @@ export default function App() {
 
   function handleSearch() {
     setSelectedId(null);
-    void search(filters);
+    void search(filters, 1);
+  }
+
+  function handleServerPage(page: number) {
+    setSelectedId(null);
+    void goToPage(page);
   }
 
   return (
@@ -169,18 +174,24 @@ export default function App() {
           loading={loading}
         />
 
-        {meta && !loading && !error && (
+        {meta && !error && (
           <p className="text-sm text-stone-600">
             Found{" "}
             <strong className="text-stone-900">{meta.facilityCount}</strong>{" "}
             facilities from{" "}
             <strong className="text-stone-900">{meta.awardCount}</strong> grant
             awards
-            {meta.scoredCount < meta.facilityCount ? (
+            {meta.totalPages > 1 ? (
               <>
                 {" "}
-                ({meta.scoredCount} scored)
+                · showing page{" "}
+                <strong className="text-stone-900">{meta.page}</strong> of{" "}
+                <strong className="text-stone-900">{meta.totalPages}</strong>
+                {" "}
+                ({meta.scoredCount} scored on this page)
               </>
+            ) : meta.scoredCount < facilities.length ? (
+              <> ({meta.scoredCount} scored)</>
             ) : null}
             .
           </p>
@@ -203,6 +214,11 @@ export default function App() {
             hideInsufficient={hideInsufficient}
             onHideInsufficientChange={setHideInsufficient}
             onSelectFacility={(f) => setSelectedId(f.id)}
+            serverPage={meta?.page}
+            serverTotalPages={meta?.totalPages}
+            serverTotalCount={meta?.facilityCount}
+            onServerPageChange={handleServerPage}
+            pageLoading={loading && facilities.length > 0}
           />
         )}
       </div>

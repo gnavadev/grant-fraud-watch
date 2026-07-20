@@ -201,16 +201,23 @@ export interface FacilitiesResponse {
   facilities: Facility[];
   meta: {
     awardCount: number;
+    /** Total facilities matching the search (all pages). */
     facilityCount: number;
+    /** Scored facilities on this page only. */
     scoredCount: number;
     insufficientCount: number;
     filters: FacilityFilters;
     disclaimer: string;
     transactionCount?: number;
+    /** 1-based page currently returned. */
+    page: number;
+    pageSize: number;
+    totalPages: number;
+    hasMore: boolean;
     cache?: {
       awards: boolean;
       transactions: boolean;
-      /** Full /api/facilities response served from Redis/disk */
+      /** Page response served from Redis/disk */
       response?: boolean;
     };
   };

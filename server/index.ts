@@ -4,6 +4,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   aggregateAwardsToFacilities,
+  DEFAULT_PAGE_SIZE,
+  isBroadSearch,
+  MAX_PAGE_SIZE,
+  normalizePageOptions,
   rescoreFacility,
 } from "./aggregate.js";
 import { cacheBackend, cacheGet, cacheKey, cacheSet } from "./cache.js";
@@ -23,7 +27,12 @@ import type {
   FacilityFilters,
   FacilityTypeKey,
 } from "./types.js";
-import { fetchAwards, fetchTransactions } from "./usaspending.js";
+import {
+  fetchAwards,
+  fetchTransactions,
+  MAX_PAGES_SEARCH,
+  MAX_PAGES_SEARCH_BROAD,
+} from "./usaspending.js";
 
 loadEnv();
 
@@ -170,21 +179,36 @@ app.get("/api/facilities", async (req, res) => {
       q: q || undefined,
     };
 
+    const pageRaw =
+      typeof req.query.page === "string" ? Number(req.query.page) : 1;
+    const pageSizeRaw =
+      typeof req.query.pageSize === "string"
+        ? Number(req.query.pageSize)
+        : DEFAULT_PAGE_SIZE;
+    const { page: reqPage, pageSize } = normalizePageOptions({
+      page: Number.isFinite(pageRaw) ? pageRaw : 1,
+      pageSize: Number.isFinite(pageSizeRaw)
+        ? Math.min(MAX_PAGE_SIZE, pageSizeRaw)
+        : DEFAULT_PAGE_SIZE,
+    });
+
     // Avoid caching personalized search results in shared proxies
     res.setHeader("Cache-Control", "private, no-store");
 
-    // Full response cache (Redis) so CA healthcare etc. is fast for everyone after 1st success
-    const responseCacheKey = cacheKey("facilities_v2", filters);
+    // Per-page response cache so CA healthcare page 1/2/... stay fast after first hit
+    const responseCacheKey = `${cacheKey("facilities_v4", filters)}_p${reqPage}_s${pageSize}`;
     const responseTtl = 6 * 60 * 60 * 1000; // 6 hours
     const cachedBody = await cacheGet<FacilitiesResponse>(
       responseCacheKey,
       responseTtl,
     );
-    if (cachedBody?.facilities?.length) {
+    if (cachedBody && Array.isArray(cachedBody.facilities)) {
       log.info("facilities_response_cache_hit", {
         ms: Date.now() - t0,
         state: filters.state ?? "",
         type: filters.type,
+        page: reqPage,
+        pageSize,
         facilities: cachedBody.facilities.length,
       });
       res.json({
@@ -201,20 +225,39 @@ app.get("/api/facilities", async (req, res) => {
       return;
     }
 
+    const broad = isBroadSearch(filters);
+    // Broad CA/type: fewer award pages, skip transactions (temporal is secondary)
+    const awardPages = broad ? MAX_PAGES_SEARCH_BROAD : MAX_PAGES_SEARCH;
+    const txnPages = broad ? 0 : Math.min(4, MAX_PAGES_SEARCH);
+
     const [awardResult, txnResult] = await Promise.all([
-      fetchAwards(filters),
-      fetchTransactions(filters).catch((err) => {
-        log.warn("transactions_fetch_failed", { err });
-        return { transactions: [], pagesFetched: 0, fromCache: false };
-      }),
+      fetchAwards(filters, awardPages),
+      txnPages > 0
+        ? fetchTransactions(filters, txnPages).catch((err) => {
+            log.warn("transactions_fetch_failed", { err });
+            return { transactions: [], pagesFetched: 0, fromCache: false };
+          })
+        : Promise.resolve({
+            transactions: [],
+            pagesFetched: 0,
+            fromCache: true as const,
+          }),
     ]);
 
-    const { facilities, transactionCount, enrichment } =
-      await aggregateAwardsToFacilities(
-        awardResult.awards,
-        filters,
-        txnResult.transactions,
-      );
+    const {
+      facilities,
+      transactionCount,
+      enrichment,
+      totalFacilityCount,
+      page,
+      pageSize: usedPageSize,
+      totalPages,
+    } = await aggregateAwardsToFacilities(
+      awardResult.awards,
+      filters,
+      txnResult.transactions,
+      { page: reqPage, pageSize },
+    );
 
     const scoredCount = facilities.filter((f) => f.fraudChance != null).length;
 
@@ -222,12 +265,16 @@ app.get("/api/facilities", async (req, res) => {
       facilities,
       meta: {
         awardCount: awardResult.awards.length,
-        facilityCount: facilities.length,
+        facilityCount: totalFacilityCount,
         scoredCount,
         insufficientCount: facilities.length - scoredCount,
         filters,
         disclaimer: DISCLAIMER,
         transactionCount,
+        page,
+        pageSize: usedPageSize,
+        totalPages,
+        hasMore: page < totalPages,
         cache: {
           awards: awardResult.fromCache,
           transactions: txnResult.fromCache,
@@ -235,7 +282,7 @@ app.get("/api/facilities", async (req, res) => {
       },
     };
 
-    // Store full response for shared Redis / disk (best-effort; may be large)
+    // Store page response for shared Redis / disk (best-effort)
     void cacheSet(responseCacheKey, body, responseTtl).catch(() => {
       /* ignore size errors */
     });
@@ -250,6 +297,9 @@ app.get("/api/facilities", async (req, res) => {
       type: filters.type,
       awards: awardResult.awards.length,
       facilities: facilities.length,
+      totalFacilities: totalFacilityCount,
+      page,
+      pageSize: usedPageSize,
       fac: enrichment.facLookups,
       sam: enrichment.samLookups,
       cacheAwards: awardResult.fromCache,

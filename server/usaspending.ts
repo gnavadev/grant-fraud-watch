@@ -44,8 +44,14 @@ const TXN_FIELDS = [
 ];
 
 const PAGE_LIMIT = 100;
-/** Deeper default pulls for better Benford samples. */
-const MAX_PAGES_SEARCH = 8; // up to 800 awards / transactions
+/** Narrow searches (city/county/q): deeper list for better samples. */
+export const MAX_PAGES_SEARCH = 6; // up to 600 awards / transactions
+/** Broad state+type only: fewer pages so free hosts stay under timeout. */
+export const MAX_PAGES_SEARCH_BROAD = 4; // up to 400 awards
+/** List hydrate: enough for true counts on most orgs without 20-page pulls. */
+export const MAX_PAGES_PER_RECIPIENT_LIST = 5; // up to 500 grants
+/** Deep / full recipient pull safety cap. */
+export const MAX_PAGES_PER_RECIPIENT = 12;
 
 function fiscalWindowYears(yearsBack = 10): {
   start_date: string;
@@ -229,8 +235,8 @@ export async function fetchAwards(
   filters: FacilityFilters,
   maxPages = MAX_PAGES_SEARCH,
 ): Promise<FetchAwardsResult> {
-  // v3 includes Recipient UEI for FAC/SAM enrichment + deep-dive links
-  const key = cacheKey("awards_v3", filters);
+  // v4 includes maxPages in key so broad (4) vs narrow (6) do not collide
+  const key = `${cacheKey("awards_v4", filters)}_mp${maxPages}`;
   const cached = await cacheGet<Omit<FetchAwardsResult, "fromCache">>(key);
   if (cached) {
     return { ...cached, fromCache: true };
@@ -245,7 +251,7 @@ export async function fetchTransactions(
   filters: FacilityFilters,
   maxPages = MAX_PAGES_SEARCH,
 ): Promise<FetchTransactionsResult> {
-  const key = cacheKey("txns_v2", filters);
+  const key = `${cacheKey("txns_v3", filters)}_mp${maxPages}`;
   const cached = await cacheGet<Omit<FetchTransactionsResult, "fromCache">>(key);
   if (cached) {
     return { ...cached, fromCache: true };
@@ -353,18 +359,18 @@ export function extractCfdaFromAward(award: AwardRow): string | null {
   return null;
 }
 
-const MAX_PAGES_PER_RECIPIENT = 20; // up to 2000 grants / recipient safety cap
-
 function grantsCacheKey(
   kind: "uei" | "name",
   id: string,
   years: number,
+  maxPages: number,
 ): string {
-  if (kind === "uei") return `grants_uei_${id}_y${years}`;
+  const pageTag = `y${years}_mp${maxPages}`;
+  if (kind === "uei") return `grants_uei_${id}_${pageTag}`;
   const hash = Buffer.from(id.toLowerCase())
     .toString("base64url")
     .slice(0, 48);
-  return `grants_name_${hash}_y${years}`;
+  return `grants_name_${hash}_${pageTag}`;
 }
 
 function filterAwardsForRecipient(
@@ -398,6 +404,7 @@ async function fetchGrantsBySearchText(
   uei: string | null,
   name: string | null,
   years: number,
+  maxPages: number,
 ): Promise<AwardRow[]> {
   const apiFilters: Record<string, unknown> = {
     award_type_codes: GRANT_TYPE_CODES,
@@ -409,7 +416,7 @@ async function fetchGrantsBySearchText(
   let page = 1;
   let hasNext = true;
 
-  while (hasNext && page <= MAX_PAGES_PER_RECIPIENT) {
+  while (hasNext && page <= maxPages) {
     const data = await recipientThrottle(() =>
       postJson<{
         results?: AwardRow[];
@@ -438,51 +445,73 @@ async function fetchGrantsBySearchText(
  * All federal **grants** (types 02–05) for one recipient over the lookback window.
  * Prefer UEI; on empty/error fall back to recipient name. Cached 12h.
  * Live calls are throttled and retried on 429/5xx.
+ *
+ * maxPages: list path uses MAX_PAGES_PER_RECIPIENT_LIST (fast); deep can use more.
  */
 export async function fetchGrantsForRecipient(opts: {
   uei?: string | null;
   name?: string | null;
   yearsBack?: number;
+  maxPages?: number;
 }): Promise<{ awards: AwardRow[]; fromCache: boolean }> {
   const uei = opts.uei?.trim().toUpperCase() || null;
   const name = opts.name?.trim() || null;
   if (!uei && !name) return { awards: [], fromCache: false };
 
   const years = opts.yearsBack ?? 10;
+  const maxPages = Math.max(
+    1,
+    Math.min(
+      MAX_PAGES_PER_RECIPIENT,
+      opts.maxPages ?? MAX_PAGES_PER_RECIPIENT_LIST,
+    ),
+  );
   const grantsTtl = 12 * 60 * 60 * 1000;
 
-  // Check caches (UEI preferred key, then name)
+  // Prefer a deeper cached pull if present (higher maxPages) for better counts
+  const pageCandidates = [
+    maxPages,
+    MAX_PAGES_PER_RECIPIENT,
+    MAX_PAGES_PER_RECIPIENT_LIST,
+  ].filter((v, i, a) => a.indexOf(v) === i);
+
   if (uei) {
-    const cached = await cacheGet<{ awards: AwardRow[] }>(
-      grantsCacheKey("uei", uei, years),
-      grantsTtl,
-    );
-    if (cached?.awards?.length) {
-      return { awards: cached.awards, fromCache: true };
+    for (const mp of pageCandidates) {
+      const cached = await cacheGet<{ awards: AwardRow[] }>(
+        grantsCacheKey("uei", uei, years, mp),
+        grantsTtl,
+      );
+      if (cached?.awards?.length) {
+        return { awards: cached.awards, fromCache: true };
+      }
     }
   }
   if (name) {
-    const cached = await cacheGet<{ awards: AwardRow[] }>(
-      grantsCacheKey("name", name, years),
-      grantsTtl,
-    );
-    if (cached?.awards?.length) {
-      return { awards: cached.awards, fromCache: true };
+    for (const mp of pageCandidates) {
+      const cached = await cacheGet<{ awards: AwardRow[] }>(
+        grantsCacheKey("name", name, years, mp),
+        grantsTtl,
+      );
+      if (cached?.awards?.length) {
+        return { awards: cached.awards, fromCache: true };
+      }
     }
   }
 
   // 1) Try UEI
   if (uei) {
     try {
-      const awards = await fetchGrantsBySearchText(uei, uei, name, years);
+      const awards = await fetchGrantsBySearchText(uei, uei, name, years, maxPages);
       if (awards.length > 0) {
-        await cacheSet(grantsCacheKey("uei", uei, years), { awards }, grantsTtl);
+        await cacheSet(
+          grantsCacheKey("uei", uei, years, maxPages),
+          { awards },
+          grantsTtl,
+        );
         return { awards, fromCache: false };
       }
-      // empty is valid but uncommon, fall through to name
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // Only log briefly; name fallback often succeeds
       if (!/429|502|503|504|timeout|fetch failed/i.test(msg)) {
         console.warn("[grantsForRecipient] uei failed", uei, msg.slice(0, 120));
       }
@@ -492,17 +521,27 @@ export async function fetchGrantsForRecipient(opts: {
   // 2) Fall back to legal name
   if (name) {
     try {
-      const awards = await fetchGrantsBySearchText(name, uei, name, years);
+      const awards = await fetchGrantsBySearchText(name, uei, name, years, maxPages);
       if (awards.length > 0) {
-        await cacheSet(grantsCacheKey("name", name, years), { awards }, grantsTtl);
+        await cacheSet(
+          grantsCacheKey("name", name, years, maxPages),
+          { awards },
+          grantsTtl,
+        );
         if (uei) {
-          // Also store under UEI so later lookups hit cache
-          await cacheSet(grantsCacheKey("uei", uei, years), { awards }, grantsTtl);
+          await cacheSet(
+            grantsCacheKey("uei", uei, years, maxPages),
+            { awards },
+            grantsTtl,
+          );
         }
         return { awards, fromCache: false };
       }
-      // Cache empty success so we don't hammer the same miss
-      await cacheSet(grantsCacheKey("name", name, years), { awards: [] }, grantsTtl);
+      await cacheSet(
+        grantsCacheKey("name", name, years, maxPages),
+        { awards: [] },
+        grantsTtl,
+      );
       return { awards: [], fromCache: false };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

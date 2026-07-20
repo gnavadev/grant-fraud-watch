@@ -50,20 +50,62 @@ export type FacLookup =
   | { status: "error"; message: string }
   | { status: "skipped" };
 
+export interface FetchFacOptions {
+  /**
+   * When false (list path), skip the second FAC findings call.
+   * Keeps going-concern / material weakness / low-risk flags (main score drivers).
+   * Default true (deep dive / rescore).
+   */
+  includeFindings?: boolean;
+}
+
+const FAC_TTL_MS = 24 * 60 * 60 * 1000;
+
+function emptyFac(clean: string): FacAuditSummary {
+  return {
+    uei: clean,
+    found: false,
+    auditYear: null,
+    goingConcern: false,
+    materialWeakness: false,
+    significantDeficiency: false,
+    materialNoncompliance: false,
+    lowRiskAuditee: true,
+    priorFindingsAgencyCount: 0,
+    totalExpended: null,
+    findingsCount: 0,
+    riskScore: 0,
+    reportId: null,
+  };
+}
+
 /**
  * Latest Single Audit summary for a UEI from Federal Audit Clearinghouse.
  * Requires FAC_API_KEY / api.data.gov key.
  * Errors are not cached so retries can succeed.
+ *
+ * List path: includeFindings=false (1 HTTP). Rescore/deep dive: full (2 HTTP).
  */
-export async function fetchFacByUei(uei: string): Promise<FacLookup> {
+export async function fetchFacByUei(
+  uei: string,
+  opts?: FetchFacOptions,
+): Promise<FacLookup> {
   const key = getFacApiKey();
   if (!key || !uei?.trim()) return { status: "skipped" };
 
   const clean = uei.trim().toUpperCase();
-  const cacheKey = `fac_${clean}`;
-  const facTtl = 24 * 60 * 60 * 1000;
-  const cached = await cacheGet<FacAuditSummary>(cacheKey, facTtl);
-  if (cached) return { status: "ok", data: cached };
+  const includeFindings = opts?.includeFindings !== false;
+  const fullKey = `fac_${clean}`;
+  const liteKey = `fac_lite_${clean}`;
+
+  // Prefer full cache when present (best accuracy, zero HTTP)
+  const fullCached = await cacheGet<FacAuditSummary>(fullKey, FAC_TTL_MS);
+  if (fullCached) return { status: "ok", data: fullCached };
+
+  if (!includeFindings) {
+    const liteCached = await cacheGet<FacAuditSummary>(liteKey, FAC_TTL_MS);
+    if (liteCached) return { status: "ok", data: liteCached };
+  }
 
   try {
     const url =
@@ -71,7 +113,7 @@ export async function fetchFacByUei(uei: string): Promise<FacLookup> {
       `&order=audit_year.desc&limit=3`;
     const res = await fetch(url, {
       headers: { "X-Api-Key": key, Accept: "application/json" },
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(15000),
     });
     if (!res.ok) {
       log.warn("fac_http_error", { uei: clean, status: res.status });
@@ -79,47 +121,36 @@ export async function fetchFacByUei(uei: string): Promise<FacLookup> {
     }
     const rows = (await res.json()) as Record<string, unknown>[];
     if (!Array.isArray(rows) || rows.length === 0) {
-      const empty: FacAuditSummary = {
-        uei: clean,
-        found: false,
-        auditYear: null,
-        goingConcern: false,
-        materialWeakness: false,
-        significantDeficiency: false,
-        materialNoncompliance: false,
-        lowRiskAuditee: true,
-        priorFindingsAgencyCount: 0,
-        totalExpended: null,
-        findingsCount: 0,
-        riskScore: 0,
-        reportId: null,
-      };
-      await cacheSet(cacheKey, empty, facTtl);
+      const empty = emptyFac(clean);
+      await cacheSet(fullKey, empty, FAC_TTL_MS);
+      await cacheSet(liteKey, empty, FAC_TTL_MS);
       return { status: "ok", data: empty };
     }
 
     const row = rows[0];
     let findingsCount = 0;
-    try {
-      const fUrl =
-        `${FAC_BASE}/federal_awards?auditee_uei=eq.${encodeURIComponent(clean)}` +
-        `&report_id=eq.${encodeURIComponent(String(row.report_id ?? ""))}` +
-        `&limit=50`;
-      const fRes = await fetch(fUrl, {
-        headers: { "X-Api-Key": key, Accept: "application/json" },
-        signal: AbortSignal.timeout(15000),
-      });
-      if (fRes.ok) {
-        const awards = (await fRes.json()) as { findings_count?: number }[];
-        if (Array.isArray(awards)) {
-          findingsCount = awards.reduce(
-            (s, a) => s + (Number(a.findings_count) || 0),
-            0,
-          );
+    if (includeFindings) {
+      try {
+        const fUrl =
+          `${FAC_BASE}/federal_awards?auditee_uei=eq.${encodeURIComponent(clean)}` +
+          `&report_id=eq.${encodeURIComponent(String(row.report_id ?? ""))}` +
+          `&limit=50`;
+        const fRes = await fetch(fUrl, {
+          headers: { "X-Api-Key": key, Accept: "application/json" },
+          signal: AbortSignal.timeout(12000),
+        });
+        if (fRes.ok) {
+          const awards = (await fRes.json()) as { findings_count?: number }[];
+          if (Array.isArray(awards)) {
+            findingsCount = awards.reduce(
+              (s, a) => s + (Number(a.findings_count) || 0),
+              0,
+            );
+          }
         }
+      } catch {
+        /* optional nested */
       }
-    } catch {
-      /* optional nested */
     }
 
     const prior = String(row.agencies_with_prior_findings ?? "00");
@@ -142,7 +173,12 @@ export async function fetchFacByUei(uei: string): Promise<FacLookup> {
       riskScore: scoreFromFac(row, findingsCount),
       reportId: row.report_id != null ? String(row.report_id) : null,
     };
-    await cacheSet(cacheKey, summary, facTtl);
+
+    if (includeFindings) {
+      await cacheSet(fullKey, summary, FAC_TTL_MS);
+    } else {
+      await cacheSet(liteKey, summary, FAC_TTL_MS);
+    }
     return { status: "ok", data: summary };
   } catch (err) {
     log.warn("fac_error", { uei: clean, err });

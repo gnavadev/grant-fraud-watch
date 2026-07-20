@@ -8,6 +8,7 @@ import type {
 /** One automatic retry only, then settle with best available score. */
 const MAX_RETRIES = 1;
 const RETRY_DELAY_MS = 800;
+const DEFAULT_PAGE_SIZE = 20;
 
 interface UseFacilitiesState {
   facilities: Facility[];
@@ -15,7 +16,10 @@ interface UseFacilitiesState {
   loading: boolean;
   error: string | null;
   searched: boolean;
-  search: (filters: FacilityFilters) => Promise<void>;
+  /** Active search filters (for page changes). */
+  activeFilters: FacilityFilters | null;
+  search: (filters: FacilityFilters, page?: number) => Promise<void>;
+  goToPage: (page: number) => Promise<void>;
   resetError: () => void;
 }
 
@@ -25,14 +29,20 @@ export function useFacilities(): UseFacilitiesState {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searched, setSearched] = useState(false);
+  const [activeFilters, setActiveFilters] = useState<FacilityFilters | null>(
+    null,
+  );
   const retryCounts = useRef<Map<string, number>>(new Map());
   const retrying = useRef<Set<string>>(new Set());
   const settled = useRef<Set<string>>(new Set());
+  const requestId = useRef(0);
 
-  const search = useCallback(async (filters: FacilityFilters) => {
+  const search = useCallback(async (filters: FacilityFilters, page = 1) => {
+    const id = ++requestId.current;
     setLoading(true);
     setError(null);
     setSearched(true);
+    setActiveFilters(filters);
     retryCounts.current = new Map();
     retrying.current = new Set();
     settled.current = new Set();
@@ -43,10 +53,13 @@ export function useFacilities(): UseFacilitiesState {
     if (filters.county) params.set("county", filters.county);
     if (filters.type && filters.type !== "all") params.set("type", filters.type);
     if (filters.q) params.set("q", filters.q);
+    params.set("page", String(Math.max(1, page)));
+    params.set("pageSize", String(DEFAULT_PAGE_SIZE));
 
     try {
       const res = await fetch(`/api/facilities?${params.toString()}`);
       const data = await res.json();
+      if (id !== requestId.current) return;
       if (!res.ok) {
         throw new Error(
           typeof data.error === "string"
@@ -58,6 +71,7 @@ export function useFacilities(): UseFacilitiesState {
       setFacilities(body.facilities);
       setMeta(body.meta);
     } catch (err) {
+      if (id !== requestId.current) return;
       setFacilities([]);
       setMeta(null);
       setError(
@@ -66,9 +80,17 @@ export function useFacilities(): UseFacilitiesState {
           : "Something went wrong. Please try again.",
       );
     } finally {
-      setLoading(false);
+      if (id === requestId.current) setLoading(false);
     }
   }, []);
+
+  const goToPage = useCallback(
+    async (page: number) => {
+      if (!activeFilters) return;
+      await search(activeFilters, page);
+    },
+    [activeFilters, search],
+  );
 
   const rescoreOne = useCallback(async (facility: Facility) => {
     if (retrying.current.has(facility.id) || settled.current.has(facility.id)) {
@@ -89,7 +111,6 @@ export function useFacilities(): UseFacilitiesState {
     const attempts = retryCounts.current.get(facility.id) ?? 0;
     if (attempts >= MAX_RETRIES) {
       settled.current.add(facility.id);
-      // Settle with existing partial score, do not spin forever
       setFacilities((prev) =>
         prev.map((f) =>
           f.id === facility.id
@@ -126,7 +147,6 @@ export function useFacilities(): UseFacilitiesState {
         );
       }
       const updated = data.facility as Facility;
-      // Server always returns scoreStatus ok with best-effort score
       settled.current.add(facility.id);
       setFacilities((prev) =>
         prev.map((f) =>
@@ -138,7 +158,6 @@ export function useFacilities(): UseFacilitiesState {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Rescore failed";
       settled.current.add(facility.id);
-      // Fall back to whatever score we already had (without failed enrichment)
       setFacilities((prev) =>
         prev.map((f) =>
           f.id === facility.id
@@ -155,7 +174,6 @@ export function useFacilities(): UseFacilitiesState {
     }
   }, []);
 
-  // Auto-retry each failed row once, then settle
   useEffect(() => {
     const failed = facilities.filter(
       (f) =>
@@ -184,7 +202,9 @@ export function useFacilities(): UseFacilitiesState {
     loading,
     error,
     searched,
+    activeFilters,
     search,
+    goToPage,
     resetError: () => setError(null),
   };
 }

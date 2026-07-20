@@ -5,14 +5,18 @@ import { cycleSort, multiSortFacilities } from "../lib/multiSort";
 import { FraudBadge } from "./FraudBadge";
 import { SortHeader } from "./SortHeader";
 
-const PAGE_SIZE = 25;
-
 interface Props {
   facilities: Facility[];
   loading: boolean;
   hideInsufficient: boolean;
   onHideInsufficientChange: (value: boolean) => void;
   onSelectFacility: (facility: Facility) => void;
+  /** Server-side page (1-based). When set, Next/Prev fetch from API. */
+  serverPage?: number;
+  serverTotalPages?: number;
+  serverTotalCount?: number;
+  onServerPageChange?: (page: number) => void;
+  pageLoading?: boolean;
 }
 
 export function FacilitiesTable({
@@ -21,12 +25,16 @@ export function FacilitiesTable({
   hideInsufficient,
   onHideInsufficientChange,
   onSelectFacility,
+  serverPage,
+  serverTotalPages,
+  serverTotalCount,
+  onServerPageChange,
+  pageLoading,
 }: Props) {
   const [sorts, setSorts] = useState<SortSpec[]>([
     { key: "fraudChance", dir: "desc" },
     { key: "grantReceived", dir: "desc" },
   ]);
-  const [page, setPage] = useState(1);
 
   const filtered = useMemo(() => {
     if (!hideInsufficient) return facilities;
@@ -38,12 +46,20 @@ export function FacilitiesTable({
     [filtered, sorts],
   );
 
-  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
-  const safePage = Math.min(page, totalPages);
-  const pageRows = sorted.slice(
-    (safePage - 1) * PAGE_SIZE,
-    safePage * PAGE_SIZE,
-  );
+  const useServerPaging =
+    typeof serverPage === "number" &&
+    typeof serverTotalPages === "number" &&
+    serverTotalPages >= 1 &&
+    typeof onServerPageChange === "function";
+
+  const safePage = useServerPaging
+    ? Math.min(Math.max(1, serverPage!), Math.max(1, serverTotalPages!))
+    : 1;
+  const totalPages = useServerPaging ? Math.max(1, serverTotalPages!) : 1;
+  const pageRows = sorted;
+  const totalCount = useServerPaging
+    ? (serverTotalCount ?? sorted.length)
+    : sorted.length;
 
   const insufficientCount = facilities.filter(
     (f) => f.fraudChance == null,
@@ -51,10 +67,9 @@ export function FacilitiesTable({
 
   function handleSort(key: SortKey) {
     setSorts((prev) => cycleSort(prev, key));
-    setPage(1);
   }
 
-  if (loading) {
+  if (loading && facilities.length === 0) {
     return <TableSkeleton />;
   }
 
@@ -68,20 +83,24 @@ export function FacilitiesTable({
             checked={hideInsufficient}
             onChange={(e) => {
               onHideInsufficientChange(e.target.checked);
-              setPage(1);
             }}
           />
-          Hide unscored facilities
+          Hide unscored on this page
           {insufficientCount > 0 && (
             <span className="text-xs text-stone-500">
               ({insufficientCount})
             </span>
           )}
         </label>
-        <p className="text-xs text-stone-500">Click a row for a deep dive</p>
+        <p className="text-xs text-stone-500">
+          Click a row for a deep dive
+          {useServerPaging ? " · pages load scores in batches" : ""}
+        </p>
       </div>
 
-      <div className="overflow-x-auto">
+      <div
+        className={`overflow-x-auto ${pageLoading ? "opacity-60 pointer-events-none" : ""}`}
+      >
         <table className="min-w-full divide-y divide-stone-100 text-sm">
           <thead className="bg-stone-50/90">
             <tr>
@@ -121,7 +140,7 @@ export function FacilitiesTable({
                 sortKey="fraudChance"
                 sorts={sorts}
                 onSort={handleSort}
-                hint="Click to sort by fraud chance."
+                hint="Click to sort this page by fraud chance."
               />
             </tr>
           </thead>
@@ -133,7 +152,7 @@ export function FacilitiesTable({
                   className="px-4 py-12 text-center text-stone-500"
                 >
                   {hideInsufficient
-                    ? 'No scored facilities. Try turning off "Hide unscored".'
+                    ? 'No scored facilities on this page. Try turning off "Hide unscored".'
                     : "No facilities match these filters."}
                 </td>
               </tr>
@@ -193,29 +212,37 @@ export function FacilitiesTable({
         </table>
       </div>
 
-      {sorted.length > PAGE_SIZE && (
+      {useServerPaging && totalPages > 1 && (
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-stone-100 bg-stone-50/60 px-4 py-3 text-sm text-stone-600">
           <span>
-            Showing {(safePage - 1) * PAGE_SIZE + 1}-
-            {Math.min(safePage * PAGE_SIZE, sorted.length)} of {sorted.length}
+            Page {safePage} of {totalPages}
+            {totalCount > 0 ? (
+              <>
+                {" "}
+                · {totalCount} facilities total
+              </>
+            ) : null}
+            {pageLoading ? (
+              <span className="ml-2 text-stone-400">Loading…</span>
+            ) : null}
           </span>
           <div className="flex items-center gap-2">
             <button
               type="button"
               className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 font-medium hover:bg-orange-50 disabled:opacity-40"
-              disabled={safePage <= 1}
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={safePage <= 1 || pageLoading}
+              onClick={() => onServerPageChange!(safePage - 1)}
             >
               Previous
             </button>
             <span className="tabular-nums text-stone-500">
-              Page {safePage} / {totalPages}
+              {safePage} / {totalPages}
             </span>
             <button
               type="button"
               className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 font-medium hover:bg-orange-50 disabled:opacity-40"
-              disabled={safePage >= totalPages}
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={safePage >= totalPages || pageLoading}
+              onClick={() => onServerPageChange!(safePage + 1)}
             >
               Next
             </button>
@@ -236,7 +263,7 @@ function TableSkeleton() {
         ))}
       </div>
       <p className="mt-4 text-center text-sm text-stone-500">
-        Loading grant data...
+        Loading grant data (page 1)…
       </p>
     </div>
   );
