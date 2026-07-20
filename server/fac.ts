@@ -61,7 +61,8 @@ export async function fetchFacByUei(uei: string): Promise<FacLookup> {
 
   const clean = uei.trim().toUpperCase();
   const cacheKey = `fac_${clean}`;
-  const cached = await cacheGet<FacAuditSummary>(cacheKey, 24 * 60 * 60 * 1000);
+  const facTtl = 24 * 60 * 60 * 1000;
+  const cached = await cacheGet<FacAuditSummary>(cacheKey, facTtl);
   if (cached) return { status: "ok", data: cached };
 
   try {
@@ -93,7 +94,7 @@ export async function fetchFacByUei(uei: string): Promise<FacLookup> {
         riskScore: 0,
         reportId: null,
       };
-      await cacheSet(cacheKey, empty);
+      await cacheSet(cacheKey, empty, facTtl);
       return { status: "ok", data: empty };
     }
 
@@ -141,7 +142,7 @@ export async function fetchFacByUei(uei: string): Promise<FacLookup> {
       riskScore: scoreFromFac(row, findingsCount),
       reportId: row.report_id != null ? String(row.report_id) : null,
     };
-    await cacheSet(cacheKey, summary);
+    await cacheSet(cacheKey, summary, facTtl);
     return { status: "ok", data: summary };
   } catch (err) {
     log.warn("fac_error", { uei: clean, err });

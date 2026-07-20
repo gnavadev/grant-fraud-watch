@@ -69,9 +69,28 @@ npm start       # node dist/index.js
 |----------|----------|-------------|
 | `FAC_API_KEY` | Recommended | Data.gov key → FAC `X-Api-Key` |
 | `SAM_API_KEY` | Recommended | SAM Account Details key (extracts + optional live API) |
+| `UPSTASH_REDIS_REST_URL` | Recommended on Render | Shared cache (survives sleep; shared by all users) |
+| `UPSTASH_REDIS_REST_TOKEN` | Recommended on Render | Upstash REST token |
 | `SAM_LIVE_FALLBACK` | No | Set `1` only to use live Entity API for registration age (burns daily quota) |
 | `PORT` | No | Default `3001` |
 | `NODE_ENV` | No | `production` on deploy |
+
+### Shared cache (Upstash Redis)
+
+Without Redis, cache is **local disk only** and free Render wipes it on sleep.
+
+1. Create a free database: [console.upstash.com](https://console.upstash.com) → Redis → Create  
+2. Copy **REST URL** and **REST TOKEN**  
+3. On Render → Environment, add:
+
+```env
+UPSTASH_REDIS_REST_URL=https://….upstash.io
+UPSTASH_REDIS_REST_TOKEN=…
+```
+
+4. Redeploy. `/api/health` should show `cacheBackend: "redis"`.
+
+First search for a filter is still slow; the **second** visitor (or retry) for the same filter should be much faster.
 
 ### SAM without burning quota (prod path)
 

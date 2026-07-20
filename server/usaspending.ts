@@ -291,7 +291,8 @@ export async function fetchCfdaBaseline(
   if (!code) return null;
 
   const key = `cfda_base_${code.replace(/[^0-9.]/g, "_")}`;
-  const cached = await cacheGet<CfdaBaseline>(key, 24 * 60 * 60 * 1000);
+  const cfdaTtl = 24 * 60 * 60 * 1000;
+  const cached = await cacheGet<CfdaBaseline>(key, cfdaTtl);
   if (cached) return cached;
 
   try {
@@ -335,7 +336,7 @@ export async function fetchCfdaBaseline(
       meanAward,
       sampleCount: amounts.length,
     };
-    await cacheSet(key, baseline);
+    await cacheSet(key, baseline, cfdaTtl);
     return baseline;
   } catch (err) {
     console.warn("[cfda baseline]", code, err);
@@ -448,12 +449,13 @@ export async function fetchGrantsForRecipient(opts: {
   if (!uei && !name) return { awards: [], fromCache: false };
 
   const years = opts.yearsBack ?? 10;
+  const grantsTtl = 12 * 60 * 60 * 1000;
 
   // Check caches (UEI preferred key, then name)
   if (uei) {
     const cached = await cacheGet<{ awards: AwardRow[] }>(
       grantsCacheKey("uei", uei, years),
-      12 * 60 * 60 * 1000,
+      grantsTtl,
     );
     if (cached?.awards?.length) {
       return { awards: cached.awards, fromCache: true };
@@ -462,7 +464,7 @@ export async function fetchGrantsForRecipient(opts: {
   if (name) {
     const cached = await cacheGet<{ awards: AwardRow[] }>(
       grantsCacheKey("name", name, years),
-      12 * 60 * 60 * 1000,
+      grantsTtl,
     );
     if (cached?.awards?.length) {
       return { awards: cached.awards, fromCache: true };
@@ -474,7 +476,7 @@ export async function fetchGrantsForRecipient(opts: {
     try {
       const awards = await fetchGrantsBySearchText(uei, uei, name, years);
       if (awards.length > 0) {
-        await cacheSet(grantsCacheKey("uei", uei, years), { awards });
+        await cacheSet(grantsCacheKey("uei", uei, years), { awards }, grantsTtl);
         return { awards, fromCache: false };
       }
       // empty is valid but uncommon, fall through to name
@@ -492,15 +494,15 @@ export async function fetchGrantsForRecipient(opts: {
     try {
       const awards = await fetchGrantsBySearchText(name, uei, name, years);
       if (awards.length > 0) {
-        await cacheSet(grantsCacheKey("name", name, years), { awards });
+        await cacheSet(grantsCacheKey("name", name, years), { awards }, grantsTtl);
         if (uei) {
           // Also store under UEI so later lookups hit cache
-          await cacheSet(grantsCacheKey("uei", uei, years), { awards });
+          await cacheSet(grantsCacheKey("uei", uei, years), { awards }, grantsTtl);
         }
         return { awards, fromCache: false };
       }
       // Cache empty success so we don't hammer the same miss
-      await cacheSet(grantsCacheKey("name", name, years), { awards: [] });
+      await cacheSet(grantsCacheKey("name", name, years), { awards: [] }, grantsTtl);
       return { awards: [], fromCache: false };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -525,10 +527,8 @@ export async function fetchUeiForRecipientId(
 ): Promise<string | null> {
   if (!recipientId || recipientId.startsWith("name:")) return null;
   const cacheK = `uei_${recipientId}`;
-  const cached = await cacheGet<{ uei: string | null }>(
-    cacheK,
-    24 * 60 * 60 * 1000,
-  );
+  const ueiTtl = 24 * 60 * 60 * 1000;
+  const cached = await cacheGet<{ uei: string | null }>(cacheK, ueiTtl);
   if (cached) return cached.uei;
 
   try {
@@ -540,12 +540,12 @@ export async function fetchUeiForRecipientId(
       },
     );
     if (!res.ok) {
-      await cacheSet(cacheK, { uei: null });
+      await cacheSet(cacheK, { uei: null }, ueiTtl);
       return null;
     }
     const data = (await res.json()) as { uei?: string | null };
     const uei = data.uei ? String(data.uei).trim().toUpperCase() : null;
-    await cacheSet(cacheK, { uei });
+    await cacheSet(cacheK, { uei }, ueiTtl);
     return uei;
   } catch {
     return null;

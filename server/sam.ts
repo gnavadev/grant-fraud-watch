@@ -292,7 +292,7 @@ async function fetchSamLive(
               return s;
             })();
 
-        await cacheSet(`sam_${clean}`, summary);
+        await cacheSet(`sam_${clean}`, summary, 24 * 60 * 60 * 1000);
         return { status: "ok" as const, data: summary };
       } catch (err) {
         if (attempt < MAX_RETRIES_429) {
@@ -320,7 +320,8 @@ export async function fetchSamByUei(uei: string): Promise<SamLookup> {
 
   const clean = uei.trim().toUpperCase();
   const cacheKey = `sam_${clean}`;
-  const cached = await cacheGet<SamEntitySummary>(cacheKey, 24 * 60 * 60 * 1000);
+  const samTtl = 24 * 60 * 60 * 1000;
+  const cached = await cacheGet<SamEntitySummary>(cacheKey, samTtl);
   if (cached) {
     return { status: "ok", data: { ...cached, source: cached.source ?? "cache" } };
   }
@@ -352,7 +353,7 @@ export async function fetchSamByUei(uei: string): Promise<SamLookup> {
       legalBusinessName: entityRow?.legalBusinessName ?? null,
       source: "extract",
     };
-    await cacheSet(cacheKey, summary);
+    await cacheSet(cacheKey, summary, samTtl);
     return { status: "ok", data: summary };
   }
 

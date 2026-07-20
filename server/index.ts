@@ -6,6 +6,7 @@ import {
   aggregateAwardsToFacilities,
   rescoreFacility,
 } from "./aggregate.js";
+import { cacheBackend } from "./cache.js";
 import { loadEnv, getFacApiKey, getSamApiKey } from "./env.js";
 import { FACILITY_TYPES, isValidFacilityType } from "./facilityTypes.js";
 import { log } from "./logger.js";
@@ -68,12 +69,14 @@ app.get("/api/health", async (_req, res) => {
   const samQuota = getSamQuotaStatus();
   const samExtract = getSamExtractStatus();
   const entityExtract = await getEntityExtractStatus();
+  const backend = cacheBackend();
   res.json({
     ok: true,
     service: "grant-fraud-watch",
     uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000),
     facKey,
     samKey,
+    cacheBackend: backend,
     samExtractLoaded: samExtract.loaded,
     samExtractCount: samExtract.count,
     samEntityExtractReady: entityExtract.ready,
@@ -88,6 +91,9 @@ app.get("/api/health", async (_req, res) => {
       !samKey
         ? "SAM_API_KEY not set, SAM enrichment disabled (keys expire ~90 days)"
         : null,
+      backend === "redis"
+        ? "Shared cache: Upstash Redis (survives sleep, shared by all users)"
+        : "Cache: local disk only (set UPSTASH_REDIS_REST_URL + TOKEN for shared cache)",
       samExtract.loaded
         ? `SAM exclusions extract loaded (${samExtract.count} UEIs)`
         : samKey
@@ -95,7 +101,7 @@ app.get("/api/health", async (_req, res) => {
           : null,
       entityExtract.ready
         ? `SAM entity extract index ready (${entityExtract.count} UEIs)`
-        : "SAM entity extract not synced (npm run sam:sync-entities) — registration age limited",
+        : "SAM entity extract not synced (npm run sam:sync-entities), registration age limited",
       samQuota.blocked
         ? `SAM live API quota exceeded until ${new Date(samQuota.until!).toISOString()} (extract mode still works)`
         : null,
@@ -256,6 +262,7 @@ app.listen(PORT, () => {
     port: PORT,
     facKey: Boolean(getFacApiKey()),
     samKey: Boolean(getSamApiKey()),
+    cacheBackend: cacheBackend(),
     clientDist,
     // __dirname helps debug whether we are running from source or dist/
     entryDir: __dirname,

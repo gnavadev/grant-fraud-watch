@@ -26,6 +26,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "jszip": "^3.10.1",
