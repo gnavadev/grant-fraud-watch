@@ -1,8 +1,19 @@
 import { cacheGet, cacheSet } from "./cache.js";
 import { getFacApiKey } from "./env.js";
 import { log } from "./logger.js";
+import { createThrottle, sleep } from "./throttle.js";
 
 const FAC_BASE = "https://api.fac.gov";
+
+/** Serialize FAC HTTP (api.data.gov rate limits; precalc is slower). */
+function facGapMs(): number {
+  if (process.env.PRECALC === "1") {
+    const n = Number(process.env.PRECALC_FAC_GAP_MS);
+    return Number.isFinite(n) && n >= 100 ? n : 500;
+  }
+  return 80;
+}
+const facThrottle = createThrottle(facGapMs);
 
 export interface FacAuditSummary {
   uei: string;
@@ -107,84 +118,111 @@ export async function fetchFacByUei(
     if (liteCached) return { status: "ok", data: liteCached };
   }
 
-  try {
-    const url =
-      `${FAC_BASE}/general?auditee_uei=eq.${encodeURIComponent(clean)}` +
-      `&order=audit_year.desc&limit=3`;
-    const res = await fetch(url, {
-      headers: { "X-Api-Key": key, Accept: "application/json" },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!res.ok) {
-      log.warn("fac_http_error", { uei: clean, status: res.status });
-      return { status: "error", message: `FAC HTTP ${res.status}` };
-    }
-    const rows = (await res.json()) as Record<string, unknown>[];
-    if (!Array.isArray(rows) || rows.length === 0) {
-      const empty = emptyFac(clean);
-      await cacheSet(fullKey, empty, FAC_TTL_MS);
-      await cacheSet(liteKey, empty, FAC_TTL_MS);
-      return { status: "ok", data: empty };
-    }
-
-    const row = rows[0];
-    let findingsCount = 0;
-    if (includeFindings) {
+  return facThrottle(async () => {
+    const maxAttempts = process.env.PRECALC === "1" ? 6 : 3;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        const fUrl =
-          `${FAC_BASE}/federal_awards?auditee_uei=eq.${encodeURIComponent(clean)}` +
-          `&report_id=eq.${encodeURIComponent(String(row.report_id ?? ""))}` +
-          `&limit=50`;
-        const fRes = await fetch(fUrl, {
+        const url =
+          `${FAC_BASE}/general?auditee_uei=eq.${encodeURIComponent(clean)}` +
+          `&order=audit_year.desc&limit=3`;
+        const res = await fetch(url, {
           headers: { "X-Api-Key": key, Accept: "application/json" },
-          signal: AbortSignal.timeout(12000),
+          signal: AbortSignal.timeout(15000),
         });
-        if (fRes.ok) {
-          const awards = (await fRes.json()) as { findings_count?: number }[];
-          if (Array.isArray(awards)) {
-            findingsCount = awards.reduce(
-              (s, a) => s + (Number(a.findings_count) || 0),
-              0,
-            );
+        if (res.status === 429) {
+          const wait = Math.min(10_000 * 2 ** attempt, 120_000);
+          log.warn("fac_rate_limited", { uei: clean, attempt, waitMs: wait });
+          await sleep(wait);
+          continue;
+        }
+        if (!res.ok) {
+          log.warn("fac_http_error", { uei: clean, status: res.status });
+          return { status: "error" as const, message: `FAC HTTP ${res.status}` };
+        }
+        const rows = (await res.json()) as Record<string, unknown>[];
+        if (!Array.isArray(rows) || rows.length === 0) {
+          const empty = emptyFac(clean);
+          await cacheSet(fullKey, empty, FAC_TTL_MS);
+          await cacheSet(liteKey, empty, FAC_TTL_MS);
+          return { status: "ok" as const, data: empty };
+        }
+
+        const row = rows[0];
+        let findingsCount = 0;
+        if (includeFindings) {
+          try {
+            const fUrl =
+              `${FAC_BASE}/federal_awards?auditee_uei=eq.${encodeURIComponent(clean)}` +
+              `&report_id=eq.${encodeURIComponent(String(row.report_id ?? ""))}` +
+              `&limit=50`;
+            const fRes = await fetch(fUrl, {
+              headers: { "X-Api-Key": key, Accept: "application/json" },
+              signal: AbortSignal.timeout(12000),
+            });
+            if (fRes.status === 429) {
+              await sleep(Math.min(10_000 * 2 ** attempt, 60_000));
+            } else if (fRes.ok) {
+              const awards = (await fRes.json()) as { findings_count?: number }[];
+              if (Array.isArray(awards)) {
+                findingsCount = awards.reduce(
+                  (s, a) => s + (Number(a.findings_count) || 0),
+                  0,
+                );
+              }
+            }
+          } catch {
+            /* optional nested */
           }
         }
-      } catch {
-        /* optional nested */
+
+        const prior = String(row.agencies_with_prior_findings ?? "00");
+        const summary: FacAuditSummary = {
+          uei: clean,
+          found: true,
+          auditYear: row.audit_year != null ? Number(row.audit_year) : null,
+          goingConcern: yes(row.is_going_concern_included),
+          materialWeakness: yes(
+            row.is_internal_control_material_weakness_disclosed,
+          ),
+          significantDeficiency: yes(
+            row.is_internal_control_deficiency_disclosed,
+          ),
+          materialNoncompliance: yes(row.is_material_noncompliance_disclosed),
+          lowRiskAuditee: yes(row.is_low_risk_auditee),
+          priorFindingsAgencyCount:
+            prior && prior !== "00"
+              ? Math.max(1, prior.replace(/0/g, "").length)
+              : 0,
+          totalExpended:
+            row.total_amount_expended != null
+              ? Number(row.total_amount_expended)
+              : null,
+          findingsCount,
+          riskScore: scoreFromFac(row, findingsCount),
+          reportId: row.report_id != null ? String(row.report_id) : null,
+        };
+
+        if (includeFindings) {
+          await cacheSet(fullKey, summary, FAC_TTL_MS);
+        } else {
+          await cacheSet(liteKey, summary, FAC_TTL_MS);
+        }
+        return { status: "ok" as const, data: summary };
+      } catch (err) {
+        if (attempt < maxAttempts - 1) {
+          await sleep(2000 * (attempt + 1));
+          continue;
+        }
+        log.warn("fac_error", { uei: clean, err });
+        return {
+          status: "error" as const,
+          message: err instanceof Error ? err.message : "FAC request failed",
+        };
       }
     }
-
-    const prior = String(row.agencies_with_prior_findings ?? "00");
-    const summary: FacAuditSummary = {
-      uei: clean,
-      found: true,
-      auditYear: row.audit_year != null ? Number(row.audit_year) : null,
-      goingConcern: yes(row.is_going_concern_included),
-      materialWeakness: yes(row.is_internal_control_material_weakness_disclosed),
-      significantDeficiency: yes(row.is_internal_control_deficiency_disclosed),
-      materialNoncompliance: yes(row.is_material_noncompliance_disclosed),
-      lowRiskAuditee: yes(row.is_low_risk_auditee),
-      priorFindingsAgencyCount:
-        prior && prior !== "00" ? Math.max(1, prior.replace(/0/g, "").length) : 0,
-      totalExpended:
-        row.total_amount_expended != null
-          ? Number(row.total_amount_expended)
-          : null,
-      findingsCount,
-      riskScore: scoreFromFac(row, findingsCount),
-      reportId: row.report_id != null ? String(row.report_id) : null,
-    };
-
-    if (includeFindings) {
-      await cacheSet(fullKey, summary, FAC_TTL_MS);
-    } else {
-      await cacheSet(liteKey, summary, FAC_TTL_MS);
-    }
-    return { status: "ok", data: summary };
-  } catch (err) {
-    log.warn("fac_error", { uei: clean, err });
     return {
-      status: "error",
-      message: err instanceof Error ? err.message : "FAC request failed",
+      status: "error" as const,
+      message: "FAC rate limited (retries exhausted)",
     };
-  }
+  });
 }

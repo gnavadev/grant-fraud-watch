@@ -33,9 +33,11 @@ import type {
   FacilityFilters,
   FacilityTypeKey,
 } from "./types.js";
+import { slimFacilitiesResponse } from "./slimResponse.js";
 import {
-  fetchAwards,
+  fetchAwardsPreferDeep,
   fetchTransactions,
+  MAX_PAGES_PRECALC,
   MAX_PAGES_SEARCH,
   MAX_PAGES_SEARCH_BROAD,
 } from "./usaspending.js";
@@ -240,12 +242,14 @@ app.get("/api/facilities", async (req, res) => {
     }
 
     const broad = isBroadSearch(filters);
-    // Broad CA/type: fewer award pages, skip transactions (temporal is secondary)
-    const awardPages = broad ? MAX_PAGES_SEARCH_BROAD : MAX_PAGES_SEARCH;
+    // Prefer deep precalc awards from Redis; live fallback uses fewer pages
+    const liveAwardPages = broad ? MAX_PAGES_SEARCH_BROAD : MAX_PAGES_SEARCH;
     const txnPages = broad ? 0 : Math.min(3, MAX_PAGES_SEARCH);
 
     const [awardResult, txnResult] = await Promise.all([
-      fetchAwards(filters, awardPages),
+      broad
+        ? fetchAwardsPreferDeep(filters, MAX_PAGES_PRECALC, liveAwardPages)
+        : fetchAwardsPreferDeep(filters, MAX_PAGES_SEARCH, liveAwardPages),
       txnPages > 0
         ? fetchTransactions(filters, txnPages).catch((err) => {
             log.warn("transactions_fetch_failed", { err });
@@ -270,7 +274,12 @@ app.get("/api/facilities", async (req, res) => {
       awardResult.awards,
       filters,
       txnResult.transactions,
-      { page: reqPage, pageSize },
+      {
+        page: reqPage,
+        pageSize,
+        // Score every org in sample for true fraud ranking (network FAC capped on cold)
+        scoreEntireSample: true,
+      },
     );
 
     const scoredCount = facilities.filter((f) => f.fraudChance != null).length;
@@ -301,8 +310,13 @@ app.get("/api/facilities", async (req, res) => {
     }).enrichment = enrichment;
 
     // Await write so the next user (or retry) hits Redis immediately
+    // Slim payload: Upstash free plan max request size is 10MB
     try {
-      await cacheSet(responseCacheKey, body, responseTtl);
+      await cacheSet(
+        responseCacheKey,
+        slimFacilitiesResponse(body),
+        responseTtl,
+      );
     } catch {
       /* best-effort */
     }

@@ -10,6 +10,16 @@ import type {
 /** Space out recipient-level grant pulls so USAspending is less likely to 429. */
 const recipientThrottle = createThrottle(120);
 
+/** Global throttle for all USAspending POSTs (precalc uses a slower gap). */
+function usaMinIntervalMs(): number {
+  if (process.env.PRECALC === "1") {
+    const n = Number(process.env.PRECALC_USA_GAP_MS);
+    return Number.isFinite(n) && n >= 200 ? n : 800;
+  }
+  return 150;
+}
+const usaPostThrottle = createThrottle(usaMinIntervalMs);
+
 const SPENDING_BY_AWARD =
   "https://api.usaspending.gov/api/v2/search/spending_by_award/";
 const SPENDING_BY_TRANSACTION =
@@ -46,8 +56,17 @@ const TXN_FIELDS = [
 const PAGE_LIMIT = 100;
 /** Narrow searches (city/county/q): deeper list for better samples. */
 export const MAX_PAGES_SEARCH = 6; // up to 600 awards / transactions
-/** Broad state+type only: fewer pages so free hosts stay under timeout. */
+/** Broad state+type live HTTP: fewer pages so free hosts stay under timeout. */
 export const MAX_PAGES_SEARCH_BROAD = 4; // up to 400 awards
+/**
+ * Precalc / offline: deep pull so "all orgs in state×type" ≈ full USAspending
+ * result set for that filter (100 awards/page). Override with PRECALC_AWARD_PAGES.
+ */
+/**
+ * Precalc award depth. Keep moderate: 40×100 full award JSON can exceed Upstash
+ * free 10MB per SET. Slimming helps; 20 pages is usually enough for ranking.
+ */
+export const MAX_PAGES_PRECALC = 20; // up to 2000 awards per state×type
 /** List hydrate: enough for true counts on most orgs without 20-page pulls. */
 export const MAX_PAGES_PER_RECIPIENT_LIST = 5; // up to 500 grants
 /** Deep / full recipient pull safety cap. */
@@ -132,12 +151,14 @@ async function postJsonOnce<T>(url: string, body: unknown): Promise<T> {
   return (await res.json()) as T;
 }
 
-/** Retry on 429 / 502 / 503 / timeouts. */
-async function postJson<T>(url: string, body: unknown, retries = 3): Promise<T> {
+/** Retry on 429 / 502 / 503 / timeouts. Precalc uses longer backoff. */
+async function postJson<T>(url: string, body: unknown, retries = 5): Promise<T> {
+  const precalc = process.env.PRECALC === "1";
+  const maxRetries = precalc ? 8 : retries;
   let lastErr: unknown;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      return await postJsonOnce<T>(url, body);
+      return await usaPostThrottle(() => postJsonOnce<T>(url, body));
     } catch (err) {
       lastErr = err;
       const status = err instanceof UsaHttpError ? err.status : 0;
@@ -148,8 +169,15 @@ async function postJson<T>(url: string, body: unknown, retries = 3): Promise<T> 
         status === 504 ||
         (err instanceof Error &&
           /timeout|aborted|network|fetch failed/i.test(err.message));
-      if (!retriable || attempt === retries) break;
-      const wait = Math.min(1500 * 2 ** attempt, 12_000);
+      if (!retriable || attempt === maxRetries) break;
+      // 429: long cool-down (USAspending is aggressive under bulk precalc)
+      const wait =
+        status === 429
+          ? Math.min(15_000 * 2 ** attempt, precalc ? 180_000 : 60_000)
+          : Math.min(1500 * 2 ** attempt, 20_000);
+      console.warn(
+        `[usaspending] ${status || "err"} retry ${attempt + 1}/${maxRetries} wait ${Math.round(wait / 1000)}s`,
+      );
       await sleep(wait);
     }
   }
@@ -231,20 +259,85 @@ async function fetchTransactionsUncached(
   return { transactions, pagesFetched: page - 1 };
 }
 
+/**
+ * Drop heavy/unused award fields before Redis/disk so deep precalc stays under
+ * Upstash free 10MB request limit.
+ */
+export function slimAwardsForCache(awards: AwardRow[]): AwardRow[] {
+  return awards.map((a) => {
+    const loc = a["Recipient Location"];
+    const slimLoc =
+      loc && typeof loc === "object"
+        ? {
+            city_name: (loc as { city_name?: string | null }).city_name ?? null,
+            county_name:
+              (loc as { county_name?: string | null }).county_name ?? null,
+            state_code: (loc as { state_code?: string | null }).state_code ?? null,
+            state_name: (loc as { state_name?: string | null }).state_name ?? null,
+          }
+        : loc;
+    return {
+      "Award ID": a["Award ID"],
+      "Recipient Name": a["Recipient Name"],
+      recipient_id: a.recipient_id,
+      "Award Amount": a["Award Amount"],
+      "Recipient Location": slimLoc as AwardRow["Recipient Location"],
+      "Award Type": a["Award Type"],
+      "CFDA Number": a["CFDA Number"],
+      "Recipient UEI": a["Recipient UEI"],
+      primary_assistance_listing: a.primary_assistance_listing
+        ? {
+            cfda_number: a.primary_assistance_listing.cfda_number ?? null,
+            cfda_program_title: null,
+          }
+        : null,
+    };
+  });
+}
+
 export async function fetchAwards(
   filters: FacilityFilters,
   maxPages = MAX_PAGES_SEARCH,
 ): Promise<FetchAwardsResult> {
-  // v4 includes maxPages in key so broad (4) vs narrow (6) do not collide
-  const key = `${cacheKey("awards_v4", filters)}_mp${maxPages}`;
+  // v5 + slim payload; maxPages in key so broad vs precalc do not collide
+  const key = `${cacheKey("awards_v5", filters)}_mp${maxPages}`;
   const cached = await cacheGet<Omit<FetchAwardsResult, "fromCache">>(key);
   if (cached) {
     return { ...cached, fromCache: true };
   }
 
-  const result = await fetchAwardsUncached(filters, maxPages);
+  const raw = await fetchAwardsUncached(filters, maxPages);
+  const result = {
+    awards: slimAwardsForCache(raw.awards),
+    pagesFetched: raw.pagesFetched,
+  };
   await cacheSet(key, result);
   return { ...result, fromCache: false };
+}
+
+/**
+ * Prefer deep precalc award list from Redis; if missing, fetch a smaller live set.
+ * Keeps ranking consistent with precalc when warm, avoids 40-page cold HTTP pulls.
+ */
+export async function fetchAwardsPreferDeep(
+  filters: FacilityFilters,
+  deepPages: number,
+  livePages: number,
+): Promise<FetchAwardsResult> {
+  const candidates = [
+    `${cacheKey("awards_v5", filters)}_mp${deepPages}`,
+    `${cacheKey("awards_v5", filters)}_mp${MAX_PAGES_PRECALC}`,
+    // legacy keys from before slim payload
+    `${cacheKey("awards_v4", filters)}_mp${deepPages}`,
+    `${cacheKey("awards_v4", filters)}_mp${MAX_PAGES_PRECALC}`,
+  ];
+  for (const deepKey of candidates) {
+    const deep = await cacheGet<Omit<FetchAwardsResult, "fromCache">>(deepKey);
+    if (deep?.awards?.length) {
+      return { ...deep, fromCache: true };
+    }
+  }
+  return fetchAwards(filters, livePages);
 }
 
 export async function fetchTransactions(

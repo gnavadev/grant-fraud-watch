@@ -113,6 +113,7 @@ export async function persistFacilityScores(
 }
 
 export function facilityToScoreEntry(f: Facility): FacilityScoreEntry {
+  // Keep small for Upstash free 10MB request limit (many SETs, each tiny)
   return {
     id: f.id,
     uei: f.uei ?? null,
@@ -130,7 +131,33 @@ export function facilityToScoreEntry(f: Facility): FacilityScoreEntry {
     sampleCount: f.sampleCount,
     fp: scoreFingerprint(f.grantReceived, f.awardCount),
     scoredAt: Date.now(),
-    enrichment: f.enrichment,
+    enrichment: f.enrichment
+      ? {
+          fac: f.enrichment.fac
+            ? {
+                found: f.enrichment.fac.found,
+                riskScore: f.enrichment.fac.riskScore,
+                findingsCount: f.enrichment.fac.findingsCount,
+                materialWeakness: f.enrichment.fac.materialWeakness,
+                goingConcern: f.enrichment.fac.goingConcern,
+                lowRiskAuditee: f.enrichment.fac.lowRiskAuditee,
+                reportId: f.enrichment.fac.reportId ?? null,
+                auditYear: f.enrichment.fac.auditYear ?? null,
+              }
+            : null,
+          sam: f.enrichment.sam
+            ? {
+                found: f.enrichment.sam.found,
+                riskScore: f.enrichment.sam.riskScore,
+                excluded: f.enrichment.sam.excluded,
+                registrationAgeDays: f.enrichment.sam.registrationAgeDays,
+                legalBusinessName: f.enrichment.sam.legalBusinessName ?? null,
+              }
+            : null,
+          subaward: f.enrichment.subaward ?? null,
+          temporal: f.enrichment.temporal ?? null,
+        }
+      : undefined,
     avgAward: f.avgAward,
     primaryCfda: f.primaryCfda,
   };

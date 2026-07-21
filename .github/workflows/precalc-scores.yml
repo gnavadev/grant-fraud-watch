@@ -35,7 +35,8 @@ permissions:
 jobs:
   precalc:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Full 52×6 universe with deep award pulls can take many hours
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 

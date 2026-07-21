@@ -93,35 +93,44 @@ UPSTASH_REDIS_REST_TOKEN=…
 
 First search for a filter is still slow; the **second** visitor (or retry) for the same filter should be much faster.
 
-### Redis precalc (facility → fraud chance)
+### Redis precalc (all orgs in each state × type)
 
-Scores for popular state/type filters are stored in Upstash as small keys:
+For every **state × facility type**, precalc:
+
+1. Deep USAspending award pull (default up to 40 pages ≈ 4000 awards)
+2. Scores **every recipient** in that pull
+3. Ranks by fraud chance
+4. Writes Redis: score map + awards + ranked page blobs
 
 ```text
-gfw:sc:v1:<facilityId>   →  { fraudChance, signals, enrichment, fp, … }
-gfw:facilities_v5_…      →  full page JSON (optional, faster first paint)
-gfw:awards_v4_…          →  USAspending award lists
+gfw:sc:v1:<facilityId>   →  fraud chance + signals
+gfw:awards_v4_…_mp40     →  deep award list
+gfw:facilities_v5_…      →  ranked pages
 ```
 
-**Local (uses your `.env` Upstash + FAC keys):**
+Universe size: **52 areas × 6 types ≈ 312 jobs**. Full run can take **many hours**.
+
+**Local (writes straight to Upstash using `.env`):**
 
 ```bash
-npm run scores:precalc
-npm run scores:precalc -- --force              # recompute everything in the universe
+# Smoke test (one filter)
 npm run scores:precalc -- --state CA --type healthcare
-npm run scores:precalc -- --pages 1            # first page only (faster test)
+
+# First 5 jobs only
+npm run scores:precalc -- --limit 5
+
+# Full universe (leave running overnight)
+npm run scores:precalc
+
+# Force recompute
+npm run scores:precalc -- --force
 ```
 
-**GitHub Action: Precalc scores** (`.github/workflows/precalc-scores.yml`)
+Requires in `.env`: `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, `FAC_API_KEY`.
 
-- Daily + manual run
-- Secrets: `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, `FAC_API_KEY` (same as Render)
-- Writes **directly to Redis** (does not need Render online)
-- Second run is mostly score-map hits (only new/changed fingerprints get FAC)
+Optional: `PRECALC_AWARD_PAGES=40` (max award pages per filter).
 
-**Warm cache** (optional, hits the live site): `npm run warm` / workflow **Warm cache** — good to prime Render’s process; precalc is enough for Redis itself.
-
-After precalc, Upstash Data Browser should list many `gfw:sc:v1:…` keys.
+**GitHub Action: Precalc scores** — same job; secrets = same Upstash + FAC as Render.
 
 ### SAM without burning quota (prod path)
 

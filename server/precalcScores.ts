@@ -1,18 +1,22 @@
 /**
- * Precalculate facility scores into Redis (score map + awards cache).
+ * Precalculate ALL orgs in each state × facility-type into Redis.
  *
- * Does NOT hit Render — runs USAspending/FAC locally and writes Upstash.
+ * For each filter:
+ *   1) Deep USAspending award pull (up to MAX_PAGES_PRECALC × 100 awards)
+ *   2) Group every recipient in that pull
+ *   3) Score every recipient (FAC light + SAM extract + sample math)
+ *   4) Rank by fraud chance → write score map + ranked page caches
  *
  * Usage:
  *   npm run scores:precalc
- *   npm run scores:precalc -- --force          # recompute even if score map hit
- *   npm run scores:precalc -- --pages 1        # only first page of each job
+ *   npm run scores:precalc -- --force
  *   npm run scores:precalc -- --state CA --type healthcare
+ *   npm run scores:precalc -- --limit 5          # first 5 jobs only (smoke test)
  *
- * Env (from .env or CI secrets):
- *   UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN  (required for shared store)
+ * Env (.env or CI):
+ *   UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN  (required)
  *   FAC_API_KEY  (recommended)
- *   SAM_API_KEY  (optional; extracts still used if bundled)
+ *   PRECALC_AWARD_PAGES  (optional, default MAX_PAGES_PRECALC)
  */
 import { loadEnv } from "./env.js";
 import {
@@ -20,18 +24,19 @@ import {
   DEFAULT_PAGE_SIZE,
 } from "./aggregate.js";
 import { cacheKey, cacheSet, probeRedis } from "./cache.js";
-import { ensureSamExtractsReady } from "./sam.js";
+import { isValidFacilityType } from "./facilityTypes.js";
 import {
   jobToFilters,
   PRECALC_UNIVERSE,
   type PrecalcJob,
 } from "./precalcUniverse.js";
+import { ensureSamExtractsReady } from "./sam.js";
+import { slimFacilitiesResponse } from "./slimResponse.js";
 import type { FacilitiesResponse, FacilityTypeKey } from "./types.js";
 import {
   fetchAwards,
-  MAX_PAGES_SEARCH_BROAD,
+  MAX_PAGES_PRECALC,
 } from "./usaspending.js";
-import { isValidFacilityType } from "./facilityTypes.js";
 
 loadEnv();
 
@@ -40,23 +45,26 @@ const DISCLAIMER =
 
 function parseArgs(argv: string[]) {
   let force = process.env.PRECALC_FORCE === "1";
-  let maxPagesPerJob: number | null = null;
   let onlyState: string | null = null;
   let onlyType: FacilityTypeKey | null = null;
+  let limit: number | null = null;
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--force") force = true;
-    else if (a === "--pages" && argv[i + 1]) {
-      maxPagesPerJob = Math.max(1, Number(argv[++i]) || 1);
-    } else if (a === "--state" && argv[i + 1]) {
+    else if (a === "--state" && argv[i + 1]) {
       onlyState = argv[++i].toUpperCase();
     } else if (a === "--type" && argv[i + 1]) {
       const t = argv[++i];
       onlyType = isValidFacilityType(t) ? t : null;
+    } else if (a === "--limit" && argv[i + 1]) {
+      limit = Math.max(1, Number(argv[++i]) || 1);
+    } else if (a === "--pages" && argv[i + 1]) {
+      // legacy: treat as limit on jobs for smoke tests
+      limit = Math.max(1, Number(argv[++i]) || 1);
     }
   }
-  return { force, maxPagesPerJob, onlyState, onlyType };
+  return { force, onlyState, onlyType, limit };
 }
 
 function selectJobs(opts: ReturnType<typeof parseArgs>): PrecalcJob[] {
@@ -67,23 +75,28 @@ function selectJobs(opts: ReturnType<typeof parseArgs>): PrecalcJob[] {
   if (opts.onlyType) {
     jobs = jobs.filter((j) => j.type === opts.onlyType);
   }
-  if (opts.maxPagesPerJob != null) {
-    jobs = jobs.map((j) => ({
-      ...j,
-      pages: Math.min(j.pages, opts.maxPagesPerJob!),
-    }));
+  if (opts.limit != null) {
+    jobs = jobs.slice(0, opts.limit);
   }
   return jobs;
+}
+
+function awardPagesForPrecalc(): number {
+  const n = Number(process.env.PRECALC_AWARD_PAGES);
+  if (Number.isFinite(n) && n >= 1) return Math.min(80, Math.floor(n));
+  return MAX_PAGES_PRECALC;
 }
 
 async function precalcJob(
   job: PrecalcJob,
   force: boolean,
+  awardPages: number,
 ): Promise<{
   label: string;
-  scored: number;
-  cacheHits: number;
-  pages: number;
+  orgs: number;
+  pagesWritten: number;
+  awards: number;
+  scoreHits: number;
   ms: number;
   error?: string;
 }> {
@@ -92,11 +105,89 @@ async function precalcJob(
   const filters = jobToFilters(job);
 
   try {
-    const awardResult = await fetchAwards(filters, MAX_PAGES_SEARCH_BROAD);
-    let scored = 0;
-    let cacheHits = 0;
+    const awardResult = await fetchAwards(filters, awardPages);
+    if (awardResult.awards.length === 0) {
+      return {
+        label,
+        orgs: 0,
+        pagesWritten: 0,
+        awards: 0,
+        scoreHits: 0,
+        ms: Date.now() - t0,
+      };
+    }
 
-    for (let page = 1; page <= job.pages; page++) {
+    // First call: score EVERY org in sample, write Redis score map, return page 1 ranked by fraud chance
+    const page1 = await aggregateAwardsToFacilities(
+      awardResult.awards,
+      filters,
+      [],
+      {
+        page: 1,
+        pageSize: DEFAULT_PAGE_SIZE,
+        skipScoreCache: force,
+        awaitScoreWrites: true,
+        scoreEntireSample: true,
+      },
+    );
+
+    const totalOrgs = page1.totalFacilityCount;
+    const totalPages = page1.totalPages;
+    let scoreHits = page1.enrichment.scoreCacheHits;
+
+    async function storePage(
+      page: number,
+      facilities: typeof page1.facilities,
+      total: number,
+      pages: number,
+      hits: number,
+    ) {
+      const scoredCount = facilities.filter((f) => f.fraudChance != null).length;
+      const body: FacilitiesResponse = {
+        facilities,
+        meta: {
+          awardCount: awardResult.awards.length,
+          facilityCount: total,
+          scoredCount,
+          insufficientCount: facilities.length - scoredCount,
+          filters,
+          disclaimer: DISCLAIMER,
+          transactionCount: 0,
+          page,
+          pageSize: DEFAULT_PAGE_SIZE,
+          totalPages: pages,
+          hasMore: page < pages,
+          cache: {
+            awards: awardResult.fromCache,
+            transactions: true,
+          },
+        },
+      };
+      (body.meta as FacilitiesResponse["meta"] & {
+        enrichment?: typeof page1.enrichment;
+      }).enrichment = {
+        ...page1.enrichment,
+        scoreCacheHits: hits,
+      };
+      const responseKey = `${cacheKey("facilities_v5", filters)}_p${page}_s${DEFAULT_PAGE_SIZE}`;
+      // Slim so Upstash free 10MB request limit is not hit
+      await cacheSet(
+        responseKey,
+        slimFacilitiesResponse(body),
+        7 * 24 * 60 * 60 * 1000,
+      );
+    }
+
+    await storePage(
+      1,
+      page1.facilities,
+      totalOrgs,
+      totalPages,
+      scoreHits,
+    );
+
+    // Remaining ranked pages (scores already in Redis → fast)
+    for (let page = 2; page <= totalPages; page++) {
       const result = await aggregateAwardsToFacilities(
         awardResult.awards,
         filters,
@@ -104,56 +195,36 @@ async function precalcJob(
         {
           page,
           pageSize: DEFAULT_PAGE_SIZE,
-          skipScoreCache: force,
+          skipScoreCache: false,
           awaitScoreWrites: true,
+          scoreEntireSample: true,
         },
       );
-
-      cacheHits += result.enrichment.scoreCacheHits;
-      scored += result.facilities.length;
-      // Scores written inside aggregate (awaitScoreWrites: true)
-
-      // Full page response cache (same key shape as /api/facilities)
-      const scoredCount = result.facilities.filter(
-        (f) => f.fraudChance != null,
-      ).length;
-      const body: FacilitiesResponse = {
-        facilities: result.facilities,
-        meta: {
-          awardCount: awardResult.awards.length,
-          facilityCount: result.totalFacilityCount,
-          scoredCount,
-          insufficientCount: result.facilities.length - scoredCount,
-          filters,
-          disclaimer: DISCLAIMER,
-          transactionCount: 0,
-          page: result.page,
-          pageSize: result.pageSize,
-          totalPages: result.totalPages,
-          hasMore: result.page < result.totalPages,
-          cache: {
-            awards: awardResult.fromCache,
-            transactions: true,
-          },
-        },
-      };
-      const responseKey = `${cacheKey("facilities_v5", filters)}_p${page}_s${DEFAULT_PAGE_SIZE}`;
-      await cacheSet(responseKey, body, 6 * 60 * 60 * 1000);
+      scoreHits += result.enrichment.scoreCacheHits;
+      await storePage(
+        page,
+        result.facilities,
+        result.totalFacilityCount,
+        result.totalPages,
+        result.enrichment.scoreCacheHits,
+      );
     }
 
     return {
       label,
-      scored,
-      cacheHits,
-      pages: job.pages,
+      orgs: totalOrgs,
+      pagesWritten: totalPages,
+      awards: awardResult.awards.length,
+      scoreHits,
       ms: Date.now() - t0,
     };
   } catch (err) {
     return {
       label,
-      scored: 0,
-      cacheHits: 0,
-      pages: 0,
+      orgs: 0,
+      pagesWritten: 0,
+      awards: 0,
+      scoreHits: 0,
       ms: Date.now() - t0,
       error: err instanceof Error ? err.message : String(err),
     };
@@ -161,63 +232,83 @@ async function precalcJob(
 }
 
 async function main() {
+  // Enables slower throttles / longer 429 backoff in usaspending + fac
+  process.env.PRECALC = "1";
+
   const opts = parseArgs(process.argv.slice(2));
   const jobs = selectJobs(opts);
+  const awardPages = awardPagesForPrecalc();
+  const jobGapMs = Number(process.env.PRECALC_JOB_GAP_MS) || 4000;
 
-  console.log("=== Facility score precalc → Redis ===");
-  console.log(`Jobs: ${jobs.length}  force=${opts.force}`);
+  console.log("=== Precalc: all orgs in each state × type → Redis ===");
+  console.log(
+    `Jobs: ${jobs.length} / universe ${PRECALC_UNIVERSE.length}  force=${opts.force}  awardPages=${awardPages} (≤${awardPages * 100} awards/filter)`,
+  );
+  console.log(
+    `Rate limits: PRECALC=1  jobGap=${jobGapMs}ms  (tune PRECALC_USA_GAP_MS / PRECALC_FAC_GAP_MS / PRECALC_JOB_GAP_MS)`,
+  );
 
   const redis = await probeRedis();
   if (!redis.configured) {
-    console.warn(
-      "WARNING: Upstash not configured. Scores will write to local disk only (.cache/).",
+    console.error(
+      "ERROR: Upstash not configured. Set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN in .env",
     );
-  } else if (!redis.ok) {
+    process.exit(1);
+  }
+  if (!redis.ok) {
     console.error(
       "ERROR: Redis probe failed:",
       redis.error ?? "unknown",
-      `\n  latency=${redis.latencyMs ?? "?"}ms`,
-      "\n  Fix UPSTASH_REDIS_REST_URL (full https://….upstash.io) + REST TOKEN.",
+      `\n  Fix URL (must be https://….upstash.io) and REST token.`,
     );
     process.exit(1);
-  } else {
-    console.log(`Redis OK (${redis.latencyMs}ms)`);
   }
+  console.log(`Redis OK (${redis.latencyMs}ms)`);
 
-  // Load SAM extracts once (exclusions / entity) so list path stays local
   try {
     await ensureSamExtractsReady();
     console.log("SAM extracts ready");
   } catch (err) {
     console.warn(
-      "SAM extracts not fully ready (continuing):",
+      "SAM extracts limited:",
       err instanceof Error ? err.message : err,
     );
   }
 
   let okJobs = 0;
-  let totalScored = 0;
-  let totalHits = 0;
+  let totalOrgs = 0;
+  let totalAwards = 0;
 
-  for (const job of jobs) {
-    process.stdout.write(`→ ${job.state}/${job.type} (${job.pages}p) … `);
-    const r = await precalcJob(job, opts.force);
+  for (let i = 0; i < jobs.length; i++) {
+    const job = jobs[i];
+    process.stdout.write(
+      `[${i + 1}/${jobs.length}] ${job.state}/${job.type} … `,
+    );
+    const r = await precalcJob(job, opts.force, awardPages);
     if (r.error) {
-      console.log(`FAIL ${r.ms}ms ${r.error.slice(0, 120)}`);
+      console.log(`FAIL ${r.ms}ms ${r.error.slice(0, 140)}`);
+      // Extra pause after failure (often 429) so the next job is less likely to fail
+      if (/429|rate/i.test(r.error)) {
+        console.log("  cooling down 60s after rate limit…");
+        await new Promise((res) => setTimeout(res, 60_000));
+      }
     } else {
       okJobs += 1;
-      totalScored += r.scored;
-      totalHits += r.cacheHits;
+      totalOrgs += r.orgs;
+      totalAwards += r.awards;
       console.log(
-        `OK ${r.ms}ms facilities=${r.scored} scoreCacheHits=${r.cacheHits}`,
+        `OK ${r.ms}ms awards=${r.awards} orgs=${r.orgs} pages=${r.pagesWritten} scoreHits=${r.scoreHits}`,
       );
     }
-    // Gentle pause for USAspending
-    await new Promise((res) => setTimeout(res, 1500));
+    // Cool down between state×type jobs (helps 429 recovery)
+    await new Promise((res) => setTimeout(res, jobGapMs));
   }
 
   console.log(
-    `\nDone: ${okJobs}/${jobs.length} jobs, ${totalScored} facility rows scored, ${totalHits} score-map hits`,
+    `\nDone: ${okJobs}/${jobs.length} jobs, ${totalOrgs} orgs scored, ${totalAwards} awards pulled`,
+  );
+  console.log(
+    "Upstash Data Browser should show gfw:sc:v1:… and gfw:facilities_v5:… / awards keys.",
   );
   if (okJobs === 0) process.exit(1);
 }

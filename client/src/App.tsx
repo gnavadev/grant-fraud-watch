@@ -199,8 +199,8 @@ export default function App() {
             ) : null}
             {" "}
             <span className="text-stone-400">
-              Grant counts marked · sample use this search sample (full list on
-              deep dive later).
+              Ranked by audit-worthiness among all facilities in this search
+              sample. Grant counts marked · sample are from the search sample.
             </span>
           </p>
         )}

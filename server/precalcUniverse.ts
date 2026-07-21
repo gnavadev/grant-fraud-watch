@@ -1,34 +1,39 @@
 /**
- * Shared universe of filters to precalculate into Redis.
- * Keep modest for free Upstash + USAspending rate limits.
+ * Precalc universe: every US state/territory × facility type (not "all").
+ * Each job pulls a deep award sample for that filter and scores EVERY recipient
+ * in that sample (true fraud-chance ranking within the sample).
  */
 import type { FacilityFilters, FacilityTypeKey } from "./types.js";
 
 export interface PrecalcJob {
   state: string;
   type: FacilityTypeKey;
-  /** Pages of facilities to score (20 each by default). */
-  pages: number;
 }
 
-/** Popular state × type combos (matches warm-cache targets + a few more). */
-export const PRECALC_UNIVERSE: PrecalcJob[] = [
-  { state: "CA", type: "healthcare", pages: 3 },
-  { state: "TX", type: "healthcare", pages: 2 },
-  { state: "NY", type: "healthcare", pages: 2 },
-  { state: "FL", type: "healthcare", pages: 2 },
-  { state: "IL", type: "healthcare", pages: 1 },
-  { state: "PA", type: "healthcare", pages: 1 },
-  { state: "OH", type: "healthcare", pages: 1 },
-  { state: "CA", type: "education", pages: 2 },
-  { state: "TX", type: "education", pages: 1 },
-  { state: "NY", type: "education", pages: 1 },
-  { state: "CA", type: "daycare", pages: 1 },
-  { state: "TX", type: "daycare", pages: 1 },
-  { state: "NY", type: "housing", pages: 1 },
-  { state: "CA", type: "housing", pages: 1 },
-  { state: "CA", type: "food", pages: 1 },
+/** 50 states + DC + PR (matches app state list). */
+export const PRECALC_STATES: string[] = [
+  "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL",
+  "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME",
+  "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH",
+  "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "PR",
+  "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
+  "WI", "WY",
 ];
+
+/** Types users can pick (exclude "all"). */
+export const PRECALC_TYPES: FacilityTypeKey[] = [
+  "healthcare",
+  "education",
+  "daycare",
+  "housing",
+  "food",
+  "other",
+];
+
+/** Full cartesian product: state × type. */
+export const PRECALC_UNIVERSE: PrecalcJob[] = PRECALC_STATES.flatMap((state) =>
+  PRECALC_TYPES.map((type) => ({ state, type })),
+);
 
 export function jobToFilters(job: PrecalcJob): FacilityFilters {
   return {
@@ -37,6 +42,6 @@ export function jobToFilters(job: PrecalcJob): FacilityFilters {
   };
 }
 
-export function totalPagesInUniverse(jobs = PRECALC_UNIVERSE): number {
-  return jobs.reduce((s, j) => s + j.pages, 0);
+export function totalJobs(jobs = PRECALC_UNIVERSE): number {
+  return jobs.length;
 }

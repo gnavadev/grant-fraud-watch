@@ -34,10 +34,6 @@ import type {
 import {
   extractCfdaFromAward,
   fetchCfdaBaseline,
-  fetchGrantsForRecipient,
-  fetchUeiForRecipientId,
-  MAX_PAGES_PER_RECIPIENT_LIST,
-  type CfdaBaseline,
 } from "./usaspending.js";
 
 interface MutableFacility {
@@ -203,6 +199,11 @@ export interface AggregatePageOptions {
   skipScoreCache?: boolean;
   /** Await score map writes (precalc); default fire-and-forget for HTTP. */
   awaitScoreWrites?: boolean;
+  /**
+   * Score every org in the award sample (network FAC/SAM for uncached),
+   * rank by fraud chance, then paginate. Used by precalc.
+   */
+  scoreEntireSample?: boolean;
 }
 
 export interface AggregateResult {
@@ -225,19 +226,17 @@ export interface AggregateResult {
 
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 50;
-/**
- * Full grant hydrate: only largest sample-$ orgs on the page.
- * Broad state+type: 0 (sample scores only, · sample label) — list stays under ~15s.
- * Narrow (city/county/q): top 5 for better counts without crushing latency.
- */
-const LIST_HYDRATE_TOP_BROAD = 0;
-const LIST_HYDRATE_TOP_NARROW = 5;
-/** FAC light lookups per page (flags only). Rest still score without FAC. */
-const LIST_FAC_TOP_BROAD = 8;
-const LIST_FAC_TOP_NARROW = 12;
+/** Live HTTP: FAC only for this many uncached orgs (rest get local sample score). */
+const HTTP_FAC_CAP = 25;
+/** Live HTTP: SAM local extract for uncached (cheap). */
+const HTTP_SAM_CAP = 80;
 
-/** Free Render proxy ~100s; leave headroom for awards fetch + JSON. */
-function enrichDeadlineMs(): number {
+/** Free Render proxy ~100s; precalc can run much longer. */
+function enrichDeadlineMs(scoreEntireSample: boolean): number {
+  if (scoreEntireSample || process.env.PRECALC === "1") {
+    const n = Number(process.env.PRECALC_BUDGET_MS);
+    return Number.isFinite(n) && n >= 60_000 ? n : 45 * 60_000; // 45 min per job default
+  }
   const n = Number(process.env.ENRICH_BUDGET_MS);
   return Number.isFinite(n) && n >= 10_000 ? n : 25_000;
 }
@@ -246,77 +245,7 @@ function sampleGrantTotal(g: MutableFacility): number {
   return g.awardAmounts.reduce((s, x) => s + Math.abs(x), 0);
 }
 
-/**
- * Replace sample awards with the recipient's full grant list (last ~10y).
- * Hydrates only the top maxHydrate by sample $ (page is already $‑sorted).
- * Remaining rows stay sample-labeled in the UI.
- */
-async function hydrateFullGrants(
-  groups: MutableFacility[],
-  deadline: number,
-  maxHydrate: number,
-): Promise<number> {
-  if (maxHydrate <= 0) return 0;
-  const targets = groups.slice(0, maxHydrate);
-  let hydrated = 0;
-
-  await mapPool(targets, 3, async (g) => {
-    if (Date.now() > deadline) return;
-    try {
-      const { awards } = await fetchGrantsForRecipient({
-        uei: g.uei,
-        name: g.name,
-        maxPages: MAX_PAGES_PER_RECIPIENT_LIST,
-      });
-      if (awards.length === 0) return;
-
-      if (!g.uei) {
-        for (const a of awards) {
-          if (a["Recipient UEI"]) {
-            g.uei = String(a["Recipient UEI"]).trim().toUpperCase();
-            break;
-          }
-        }
-      }
-
-      const amounts: number[] = [];
-      const cfdaCounts = new Map<string, number>();
-      const awardTypes = new Set<string>();
-
-      for (const award of awards) {
-        const amount = award["Award Amount"];
-        if (
-          typeof amount === "number" &&
-          Number.isFinite(amount) &&
-          amount !== 0
-        ) {
-          amounts.push(amount);
-        }
-        const cfda = extractCfdaFromAward(award);
-        if (cfda) {
-          cfdaCounts.set(cfda, (cfdaCounts.get(cfda) ?? 0) + 1);
-        }
-        if (award["Award Type"]) {
-          awardTypes.add(String(award["Award Type"]));
-        }
-      }
-
-      g.awardAmounts = amounts;
-      g.scoreAmounts = cleanAmountsForScoring(amounts);
-      g.cfdaCounts = cfdaCounts.size > 0 ? cfdaCounts : g.cfdaCounts;
-      g.awardTypes = awardTypes.size > 0 ? awardTypes : g.awardTypes;
-      g.grantsHydrated = true;
-      g.hydratedGrantCount = awards.length;
-      hydrated += 1;
-    } catch {
-      /* keep sample-based data */
-    }
-  });
-
-  return hydrated;
-}
-
-/** Broad state/type searches: fewer upstream calls (still free-tier friendly). */
+/** Broad state/type searches: fewer upstream calls on live HTTP. */
 export function isBroadSearch(filters: FacilityFilters): boolean {
   return !filters.city?.trim() && !filters.county?.trim() && !filters.q?.trim();
 }
@@ -357,31 +286,25 @@ export async function aggregateAwardsToFacilities(
     });
   }
 
-  // Stable order for pagination: largest sample grant $ first
+  // Largest sample $ first only for FAC priority when network is capped
   groups.sort((a, b) => sampleGrantTotal(b) - sampleGrantTotal(a));
+
+  const scoreEntireSample = Boolean(pageOpts?.scoreEntireSample);
+  const skipScoreCache = Boolean(pageOpts?.skipScoreCache);
+  const awaitScoreWrites = Boolean(pageOpts?.awaitScoreWrites);
+  const deadline = Date.now() + enrichDeadlineMs(scoreEntireSample);
+  const broad = isBroadSearch(filters);
 
   const { page: rawPage, pageSize } = normalizePageOptions(pageOpts);
   const totalFacilityCount = groups.length;
-  const totalPages = Math.max(1, Math.ceil(totalFacilityCount / pageSize) || 1);
-  const page = Math.min(rawPage, totalPages);
-  const start = (page - 1) * pageSize;
-  // Enrich only this page so broad CA healthcare fits under free-host timeouts
-  const pageGroups = groups.slice(start, start + pageSize);
 
-  const deadline = Date.now() + enrichDeadlineMs();
-  const broad = isBroadSearch(filters);
-  const hydrateTop = broad ? LIST_HYDRATE_TOP_BROAD : LIST_HYDRATE_TOP_NARROW;
-  const facTop = broad ? LIST_FAC_TOP_BROAD : LIST_FAC_TOP_NARROW;
-
-  // Load facility → fraud-chance map (small Redis keys, shared across searches)
-  const skipScoreCache = Boolean(pageOpts?.skipScoreCache);
-  const awaitScoreWrites = Boolean(pageOpts?.awaitScoreWrites);
+  // Score map for ALL orgs in sample (true ranking needs every row scored)
   const scoreMap = skipScoreCache
-    ? new Map()
-    : await getFacilityScores(pageGroups.map((g) => g.id));
+    ? new Map<string, Awaited<ReturnType<typeof getFacilityScores>> extends Map<string, infer V> ? V : never>()
+    : await getFacilityScores(groups.map((g) => g.id));
   const cachedOk = new Set<string>();
   if (!skipScoreCache) {
-    for (const g of pageGroups) {
+    for (const g of groups) {
       const entry = scoreMap.get(g.id);
       if (!entry) continue;
       const grantReceived = positiveAmounts(g.awardAmounts).reduce(
@@ -396,86 +319,53 @@ export async function aggregateAwardsToFacilities(
   }
   const scoreCacheHits = cachedOk.size;
 
-  // UEI backfill is slow (USAspending profile). Skip on broad — awards usually have UEI.
-  if (!broad) {
-    const missingUei = pageGroups.filter(
-      (g) =>
-        !cachedOk.has(g.id) &&
-        !g.uei &&
-        g.id &&
-        !g.id.startsWith("name:"),
-    );
-    await mapPool(missingUei.slice(0, 10), 4, async (g) => {
-      if (Date.now() > deadline) return;
-      const uei = await fetchUeiForRecipientId(g.id);
-      if (uei) g.uei = uei;
-    });
-  }
+  const needNetwork = groups.filter((g) => !cachedOk.has(g.id));
 
   type FacData = Awaited<ReturnType<typeof fetchFacByUei>>;
   type SamData = Awaited<ReturnType<typeof fetchSamByUei>>;
   const facByUei = new Map<string, FacData>();
   const samByUei = new Map<string, SamData>();
-  const baselineMap = new Map<string, CfdaBaseline | null>();
-  let subMap = new Map<string, ReturnType<typeof subawardConcentrationByPrime> extends Map<string, infer V> ? V : never>();
+  let subMap = new Map<
+    string,
+    ReturnType<typeof subawardConcentrationByPrime> extends Map<string, infer V>
+      ? V
+      : never
+  >();
   let subawardRows = 0;
-  let grantsHydratedCount = 0;
+  const grantsHydratedCount = 0;
 
-  // Only enrich rows without a valid score map hit
-  const needEnrich = pageGroups.filter((g) => !cachedOk.has(g.id));
-  const pageUeis = [
-    ...new Set(
-      needEnrich.map((g) => g.uei).filter((u): u is string => Boolean(u)),
-    ),
-  ];
+  // Precalc (awaitScoreWrites): FAC/SAM for every uncached org.
+  // Live HTTP: still score/rank everyone (local math) but cap network FAC/SAM.
+  const fullNetwork = scoreEntireSample && awaitScoreWrites;
+  const facTargets = fullNetwork
+    ? needNetwork
+    : needNetwork.slice(0, HTTP_FAC_CAP);
+  const samTargets = fullNetwork
+    ? needNetwork
+    : needNetwork.slice(0, HTTP_SAM_CAP);
+
   const facUeis = [
     ...new Set(
-      needEnrich
-        .slice(0, facTop)
-        .map((g) => g.uei)
-        .filter((u): u is string => Boolean(u)),
+      facTargets.map((g) => g.uei).filter((u): u is string => Boolean(u)),
+    ),
+  ];
+  const samUeis = [
+    ...new Set(
+      samTargets.map((g) => g.uei).filter((u): u is string => Boolean(u)),
     ),
   ];
 
-  // Hydrate (optional) ∥ FAC light ∥ SAM local — only uncached rows
   await Promise.all([
+    // Precalc: FAC concurrency 1 (serialized + throttle) to avoid api.data.gov 429
+    mapPool(facUeis, fullNetwork ? 1 : 3, async (uei) => {
+      if (Date.now() > deadline) return;
+      facByUei.set(uei, await fetchFacByUei(uei, { includeFindings: false }));
+    }),
+    mapPool(samUeis, fullNetwork ? 12 : 20, async (uei) => {
+      samByUei.set(uei, await fetchSamByUei(uei));
+    }),
     (async () => {
-      grantsHydratedCount = await hydrateFullGrants(
-        needEnrich,
-        deadline,
-        hydrateTop,
-      );
-    })(),
-    (async () => {
-      await mapPool(facUeis, 5, async (uei) => {
-        if (Date.now() > deadline) return;
-        facByUei.set(
-          uei,
-          await fetchFacByUei(uei, { includeFindings: false }),
-        );
-      });
-    })(),
-    (async () => {
-      await mapPool(pageUeis, 20, async (uei) => {
-        samByUei.set(uei, await fetchSamByUei(uei));
-      });
-    })(),
-    (async () => {
-      if (broad || Date.now() > deadline) return;
-      const cfdaNeeded = new Set<string>();
-      for (const g of needEnrich.slice(0, hydrateTop || 5)) {
-        const c = primaryCfda(g.cfdaCounts);
-        if (c) cfdaNeeded.add(c);
-      }
-      await Promise.all(
-        [...cfdaNeeded].slice(0, 3).map(async (code) => {
-          if (Date.now() > deadline) return;
-          baselineMap.set(code, await fetchCfdaBaseline(code));
-        }),
-      );
-    })(),
-    (async () => {
-      if (broad || Date.now() > deadline) return;
+      if (broad || fullNetwork || Date.now() > deadline) return;
       try {
         const sub = await fetchSubawards(filters, 2);
         subawardRows = sub.rows.length;
@@ -486,11 +376,10 @@ export async function aggregateAwardsToFacilities(
     })(),
   ]);
 
-  // Temporal from transactions (may be empty on broad searches)
   const txnByRecipient = groupTransactionsByRecipient(transactions);
 
-  const facilities: Facility[] = pageGroups.map((m) => {
-    // Prefer full recipient grant count (USASpending Grants tab), not sample size
+  // Build a Facility for EVERY org in the sample
+  const allFacilities: Facility[] = groups.map((m) => {
     const awardCount =
       m.hydratedGrantCount != null
         ? m.hydratedGrantCount
@@ -504,7 +393,6 @@ export async function aggregateAwardsToFacilities(
     const features = extractAmountFeatures(m.scoreAmounts);
     const benfordDetail = scoreAmountsWithBenford(m.scoreAmounts);
 
-    // Fast path: facility → fraud chance map hit
     const cached = scoreMap.get(m.id);
     if (cached && cachedOk.has(m.id)) {
       const base: Facility = {
@@ -525,7 +413,9 @@ export async function aggregateAwardsToFacilities(
         benfordScore: cached.benfordScore,
         multiScore: cached.multiScore,
         signals: cached.signals,
-        avgAward: cached.avgAward ?? (awardCount ? grantReceived / awardCount : null),
+        avgAward:
+          cached.avgAward ??
+          (awardCount ? grantReceived / awardCount : null),
         primaryCfda: cfda ?? cached.primaryCfda,
         awardTypes: types,
         uei: m.uei ?? cached.uei,
@@ -547,7 +437,6 @@ export async function aggregateAwardsToFacilities(
       return applyScoreEntry(base, cached);
     }
 
-    const baseline = cfda ? (baselineMap.get(cfda) ?? null) : null;
     const facLookup = m.uei ? facByUei.get(m.uei) : undefined;
     const samLookup = m.uei ? samByUei.get(m.uei) : undefined;
     const fac = facLookup?.status === "ok" ? facLookup.data : null;
@@ -558,14 +447,19 @@ export async function aggregateAwardsToFacilities(
           (samLookup && samLookup.status === "error")),
     );
     const failReasons: string[] = [];
-    if (facLookup?.status === "error") failReasons.push(`FAC: ${facLookup.message}`);
-    if (samLookup?.status === "error") failReasons.push(`SAM: ${samLookup.message}`);
+    if (facLookup?.status === "error") {
+      failReasons.push(`FAC: ${facLookup.message}`);
+    }
+    if (samLookup?.status === "error") {
+      failReasons.push(`SAM: ${samLookup.message}`);
+    }
 
     const sub = subMap.get(m.id) ?? null;
     const txns = txnByRecipient.get(m.id) ?? [];
     const temporal =
       txns.length > 0 ? temporalRiskFromTransactions(m.id, txns) : null;
 
+    // Always compute a score for ranking (local sample + any FAC/SAM we have)
     const multi = computeMultiSignalScore({
       scoreAmounts: m.scoreAmounts,
       features,
@@ -573,7 +467,7 @@ export async function aggregateAwardsToFacilities(
       awardCount,
       awardTypes: types,
       usedTransactions: m.usedTransactions,
-      cfdaBaseline: baseline,
+      cfdaBaseline: null,
       fac,
       sam,
       subaward: sub,
@@ -656,12 +550,12 @@ export async function aggregateAwardsToFacilities(
     };
   });
 
-  // Persist facility → fraud chance (small keys for Upstash)
-  const toWrite = facilities.filter(
+  // Persist every newly scored org (full ranking set)
+  const toWrite = allFacilities.filter(
     (f) => f.scoreStatus === "ok" && (skipScoreCache || !cachedOk.has(f.id)),
   );
   if (toWrite.length > 0) {
-    if (awaitScoreWrites) {
+    if (awaitScoreWrites || scoreEntireSample) {
       await persistFacilityScores(toWrite);
     } else {
       void persistFacilityScores(toWrite).catch(() => {
@@ -670,13 +564,18 @@ export async function aggregateAwardsToFacilities(
     }
   }
 
-  // Within this page: fraud chance first, then dollars
-  facilities.sort((a, b) => {
+  // True ranking: fraud chance desc, then grant $
+  allFacilities.sort((a, b) => {
     const fa = a.fraudChance ?? -1;
     const fb = b.fraudChance ?? -1;
     if (fb !== fa) return fb - fa;
     return b.grantReceived - a.grantReceived;
   });
+
+  const totalPages = Math.max(1, Math.ceil(totalFacilityCount / pageSize) || 1);
+  const page = Math.min(rawPage, totalPages);
+  const start = (page - 1) * pageSize;
+  const facilities = allFacilities.slice(start, start + pageSize);
 
   return {
     facilities,

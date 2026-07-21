@@ -138,9 +138,20 @@ async function ensureCacheDir(): Promise<void> {
   await fs.mkdir(CACHE_DIR, { recursive: true });
 }
 
+/**
+ * Windows forbids `:` and other chars in filenames. Redis keys may use `sc:v1:…`.
+ * Map to a safe single path segment for disk only (Redis keeps the real key).
+ */
+function diskSafeKey(key: string): string {
+  return key
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+    .replace(/_+/g, "_")
+    .slice(0, 180);
+}
+
 async function diskGet<T>(key: string, ttlMs: number): Promise<T | null> {
   try {
-    const file = path.join(CACHE_DIR, `${key}.json`);
+    const file = path.join(CACHE_DIR, `${diskSafeKey(key)}.json`);
     const raw = await fs.readFile(file, "utf8");
     const parsed = JSON.parse(raw) as CacheEnvelope<T>;
     if (!parsed.savedAt || Date.now() - parsed.savedAt > ttlMs) {
@@ -158,13 +169,20 @@ async function diskSet<T>(
   ttlMs: number,
 ): Promise<void> {
   await ensureCacheDir();
-  const file = path.join(CACHE_DIR, `${key}.json`);
+  const file = path.join(CACHE_DIR, `${diskSafeKey(key)}.json`);
   const envelope: CacheEnvelope<T> = {
     savedAt: Date.now(),
     data,
     ttlMs,
   };
-  await fs.writeFile(file, JSON.stringify(envelope), "utf8");
+  // Write via temp + rename so concurrent precalc workers don't race mkdir/ENOENT
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(envelope), "utf8");
+  await fs.rename(tmp, file).catch(async () => {
+    // Windows: rename over existing can fail; overwrite
+    await fs.copyFile(tmp, file);
+    await fs.unlink(tmp).catch(() => {});
+  });
 }
 
 /** Avoid flooding Render logs when Upstash is flaky (rate limit / network). */
@@ -205,6 +223,9 @@ async function redisGet<T>(key: string, ttlMs: number): Promise<T | null> {
   }
 }
 
+/** Upstash free plan max request size is 10MB — stay under with headroom. */
+const MAX_REDIS_PAYLOAD_BYTES = 9 * 1024 * 1024;
+
 async function redisSet<T>(
   key: string,
   data: T,
@@ -218,6 +239,16 @@ async function redisSet<T>(
       data,
       ttlMs,
     };
+    // Rough size check (UTF-16 code units ≈ bytes for ASCII JSON)
+    const payload = JSON.stringify(envelope);
+    if (payload.length > MAX_REDIS_PAYLOAD_BYTES) {
+      logRedisFail(
+        "redis_set_skipped_too_large",
+        key,
+        `payload ~${Math.round(payload.length / (1024 * 1024))}MB exceeds free 10MB limit (disk only)`,
+      );
+      return;
+    }
     const exSec = Math.max(60, Math.ceil(ttlMs / 1000));
     await r.set(redisKey(key), envelope, { ex: exSec });
   } catch (err) {
