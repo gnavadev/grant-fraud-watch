@@ -1,0 +1,12 @@
+{
+  "fyStart": 2021,
+  "fyEnd": 2025,
+  "assistanceTypeCodes": ["02", "03", "04", "05"],
+  "usaArchiveBase": "https://files.usaspending.gov/award_data_archive",
+  "usaArchiveDateTag": "20260706",
+  "preferAllAgenciesFile": true,
+  "facBase": "https://app.fac.gov/dissemination/public-data/gsa/full",
+  "facTables": ["general", "findings", "federal_awards"],
+  "minEvidenceN": 3,
+  "dataDir": "data/bulk"
+}

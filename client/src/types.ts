@@ -150,6 +150,11 @@ export interface FacilitiesResponse {
       transactions: boolean;
       response?: boolean;
     };
+    bulk?: {
+      buildId: string;
+      mode: "bulk";
+      nScored: number;
+    };
   };
 }
 

@@ -93,6 +93,29 @@ UPSTASH_REDIS_REST_TOKEN=…
 
 First search for a filter is still slow; the **second** visitor (or retry) for the same filter should be much faster.
 
+### Bulk offline data (next-gen scoring)
+
+Replace rate-limited API crawl with Award Data Archive + FAC CSV downloads:
+
+- Docs: [`docs/bulk-data.md`](docs/bulk-data.md)
+- Config: [`bulk/config.json`](bulk/config.json) (FY 2021–2025, grant codes 02–05)
+
+```bash
+npm run bulk:list-usa
+npm run bulk:download-usa -- --fy 2024 --agency All   # large ~1GB+
+npm run bulk:download-fac
+# unzip USA CSVs into data/bulk/raw/usa_extracted/
+npm i duckdb
+npm run bulk:load
+npm run bulk:verify
+# Score offline (no HTTP) and publish ranks to Upstash Redis:
+npm run bulk:score-publish                 # all states in DuckDB
+npm run bulk:score-publish -- --state CA   # one state (faster)
+```
+
+Render env: `SCORING_MODE=auto` (default) uses bulk ranks when present, else live APIs.
+`SCORING_MODE=bulk` serves only offline ranks.
+
 ### Redis precalc (all orgs in each state × type)
 
 For every **state × facility type**, precalc:

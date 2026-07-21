@@ -21,6 +21,12 @@
     "sam:publish-data": "tsx server/samPublishData.ts",
     "warm": "node scripts/warm-cache.mjs",
     "scores:precalc": "tsx server/precalcScores.ts",
+    "bulk:list-usa": "node scripts/bulk/list-usa.mjs",
+    "bulk:download-usa": "node scripts/bulk/download-usa.mjs",
+    "bulk:download-fac": "node scripts/bulk/download-fac.mjs",
+    "bulk:load": "node scripts/bulk/load-duckdb.mjs",
+    "bulk:verify": "node scripts/bulk/verify.mjs",
+    "bulk:score-publish": "tsx server/bulkPublish.ts",
     "docker:build": "docker build -t grant-fraud-watch .",
     "docker:run": "docker run --rm -p 3001:3001 --env-file .env grant-fraud-watch"
   },
@@ -30,6 +36,7 @@
   "dependencies": {
     "@upstash/redis": "^1.38.0",
     "cors": "^2.8.5",
+    "duckdb": "^1.4.4",
     "express": "^5.1.0",
     "jszip": "^3.10.1",
     "yauzl": "^3.4.0"

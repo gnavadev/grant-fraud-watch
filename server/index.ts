@@ -10,6 +10,7 @@ import {
   normalizePageOptions,
   rescoreFacility,
 } from "./aggregate.js";
+import { getFacilitiesFromBulk } from "./bulkRedis.js";
 import {
   cacheBackend,
   cacheGet,
@@ -108,6 +109,15 @@ app.get("/api/health", async (_req, res) => {
   const samExtract = getSamExtractStatus();
   const entityExtract = await getEntityExtractStatus();
 
+  const scoringMode = (process.env.SCORING_MODE ?? "auto").trim().toLowerCase();
+  let bulkBuildId: string | null = null;
+  try {
+    const { getBulkBuildId } = await import("./bulkRedis.js");
+    bulkBuildId = await getBulkBuildId();
+  } catch {
+    /* ignore */
+  }
+
   res.json({
     ok: true,
     service: "grant-fraud-watch",
@@ -115,6 +125,8 @@ app.get("/api/health", async (_req, res) => {
     facKey,
     samKey,
     cacheBackend: backend,
+    scoringMode,
+    bulkBuildId,
     /** True only if SET+GET against Upstash succeeded (not just env present). */
     redisOk: redisProbe.ok,
     redisConfigured: redisProbe.configured,
@@ -210,6 +222,43 @@ app.get("/api/facilities", async (req, res) => {
 
     // Avoid caching personalized search results in shared proxies
     res.setHeader("Cache-Control", "private, no-store");
+
+    /**
+     * Scoring modes:
+     *   bulk  — Redis ranks from DuckDB offline build only
+     *   auto  — try bulk first, else legacy live APIs (default)
+     *   legacy — always live USAspending/FAC path
+     */
+    const scoringMode = (
+      process.env.SCORING_MODE ?? "auto"
+    ).trim().toLowerCase();
+
+    if (scoringMode === "bulk" || scoringMode === "auto") {
+      const bulkBody = await getFacilitiesFromBulk(
+        filters,
+        reqPage,
+        pageSize,
+      );
+      if (bulkBody) {
+        log.info("facilities_bulk_hit", {
+          ms: Date.now() - t0,
+          state: filters.state ?? "",
+          type: filters.type,
+          page: reqPage,
+          facilities: bulkBody.facilities.length,
+          buildId: bulkBody.meta.bulk?.buildId,
+        });
+        res.json(bulkBody);
+        return;
+      }
+      if (scoringMode === "bulk") {
+        res.status(503).json({
+          error:
+            "Bulk ranking not available for this filter yet. Run npm run bulk:score-publish, or set SCORING_MODE=auto.",
+        });
+        return;
+      }
+    }
 
     // Per-page response cache (v5: faster list path). First hit fills it.
     const responseCacheKey = `${cacheKey("facilities_v5", filters)}_p${reqPage}_s${pageSize}`;

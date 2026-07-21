@@ -220,5 +220,11 @@ export interface FacilitiesResponse {
       /** Page response served from Redis/disk */
       response?: boolean;
     };
+    /** Present when results come from offline bulk build (DuckDB → Redis). */
+    bulk?: {
+      buildId: string;
+      mode: "bulk";
+      nScored: number;
+    };
   };
 }

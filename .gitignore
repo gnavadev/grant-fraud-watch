@@ -18,19 +18,29 @@ client/.cache/
 data/sam/entities.sqlite
 data/sam/*.zip
 data/sam/*.dat
+# Bulk offline downloads (USAspending archive + FAC CSVs + parquet)
+data/bulk/raw/
+data/bulk/parquet/
+data/bulk/duckdb/
+data/bulk/probe/
+data/bulk/checkpoint.json
 tmp/
 temp/
 *.tmp
 
 # Environment & secrets — never commit real keys
 .env
+.env.*
+!.env.example
 .env.local
 .env.*.local
 .env.development
 .env.production
 .env.staging
-# Keep the template for deploy docs
-!.env.example
+*.pem
+*.key
+*credentials*
+*secret*
 
 # Logs & debug
 logs/

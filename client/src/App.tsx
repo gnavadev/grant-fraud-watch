@@ -199,8 +199,9 @@ export default function App() {
             ) : null}
             {" "}
             <span className="text-stone-400">
-              Ranked by audit-worthiness among all facilities in this search
-              sample. Grant counts marked · sample are from the search sample.
+              {meta.bulk
+                ? "Offline bulk ranking (USAspending archive + FAC). Ranked by audit-worthiness among scored recipients in this state/type."
+                : "Ranked by audit-worthiness among facilities in this search. Grant counts marked · sample are from the live sample."}
             </span>
           </p>
         )}
