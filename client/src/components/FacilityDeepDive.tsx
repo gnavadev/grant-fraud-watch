@@ -297,7 +297,7 @@ export function FacilityDeepDive({ facility: f, onClose }: Props) {
                       ? `Currently active public registration (extract). Registered about ${Math.round(f.enrichment.sam.registrationAgeDays / 365)} year(s).${f.uei ? ` UEI: ${f.uei}` : ""}`
                       : `Public SAM hit on file (exclusion or registration).${f.uei ? ` UEI: ${f.uei}` : ""}`
                   : f.uei
-                    ? `No currently active public registration for UEI ${f.uei} in our SAM extract (expired, opted out of public display, or not registered). SAM entity link stays disabled — search sam.gov by this UEI to double-check.`
+                    ? `No currently active public registration for UEI ${f.uei} in our SAM extract (expired, opted out of public display, or not registered). SAM entity link stays disabled.`
                     : "No UEI available for SAM lookup."}
               </li>
               <li className="rounded-lg border border-stone-100 px-3 py-2">

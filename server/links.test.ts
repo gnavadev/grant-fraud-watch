@@ -119,17 +119,17 @@ assert(
 const samOk = linksFac.find((l) => l.label.includes("SAM.gov entity search"));
 assert(samOk?.available === true, "SAM available when found");
 assert(
-  samOk?.href?.includes("status=") !== true ||
-    linksFac.some((l) => l.href?.includes("status=null")),
-  "entity coreData uses status=null",
+  !linksFac.some((l) => l.label === "SAM.gov entity information"),
+  "no entity information deep link (404s)",
 );
-const core = linksFac.find((l) => l.label === "SAM.gov entity information");
-assert(core?.href?.includes("status=null") === true, "coreData status=null");
-assert(!core?.href?.includes("status=active"), "no lowercase status=active");
+assert(
+  !samOk?.description?.toLowerCase().includes("paste"),
+  "no paste-UEI helper text",
+);
 const samNo = linksNo.find((l) => l.label.startsWith("SAM.gov entity"));
 assert(samNo?.available === false, "SAM grayed when not found");
 
-// Exclusion-only: exclusions search + entity links
+// Exclusion-only: exclusions search + entity search
 const samExcl = baseFacility({
   enrichment: {
     fac: null,
