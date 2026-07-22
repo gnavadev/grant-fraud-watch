@@ -295,6 +295,60 @@ export async function getBulkBuildId(): Promise<string | null> {
   return v ? String(v) : null;
 }
 
+function normPlace(s: string | null | undefined): string {
+  return (s ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/\bcounty\b/g, "")
+    .trim();
+}
+
+/** Case-insensitive place match: exact, contains, or "Los Angeles" vs "LOS ANGELES". */
+function matchesPlace(
+  field: string | null | undefined,
+  needle: string | undefined,
+): boolean {
+  if (!needle?.trim()) return true;
+  const f = normPlace(field);
+  const n = normPlace(needle);
+  if (!n) return true;
+  if (!f) return false;
+  return f === n || f.includes(n) || n.includes(f);
+}
+
+function matchesName(
+  name: string | null | undefined,
+  needle: string | undefined,
+): boolean {
+  if (!needle?.trim()) return true;
+  const f = (name ?? "").trim().toLowerCase();
+  const n = needle.trim().toLowerCase();
+  return f.includes(n);
+}
+
+async function loadFacilitiesByIds(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  r: any,
+  buildId: string,
+  ids: string[],
+): Promise<Facility[]> {
+  const out: Facility[] = [];
+  for (let i = 0; i < ids.length; i += 40) {
+    const chunk = ids.slice(i, i + 40);
+    const keys = chunk.map((id) => bulkFacKey(buildId, id));
+    const rows = (await r.mget(...keys)) as (Facility | null)[];
+    for (const fac of rows) {
+      if (fac && typeof fac === "object" && fac.id) out.push(fac);
+    }
+  }
+  return out;
+}
+
+/**
+ * Serve ranked facilities from Redis bulk build.
+ * City / county / name (q) filter in-memory on facility hashes — no live APIs.
+ */
 export async function getFacilitiesFromBulk(
   filters: FacilityFilters,
   page: number,
@@ -309,32 +363,104 @@ export async function getFacilitiesFromBulk(
   const state = filters.state?.trim().toUpperCase();
   if (!state) return null;
 
-  if (filters.city?.trim() || filters.county?.trim() || filters.q?.trim()) {
-    return null;
-  }
-
   const type: FacilityTypeKey | string = filters.type ?? "all";
   const zkey = bulkRankKey(buildId, state, type);
   const meta = await r.get<BulkRankMeta>(bulkMetaKey(buildId, state, type));
 
-  const total = meta?.nScored ?? (await r.zcard(zkey)) ?? 0;
-  if (!total) return null;
+  const zcard = (await r.zcard(zkey)) ?? 0;
+  if (!zcard && !meta?.nScored) return null;
+
+  const cityQ = filters.city?.trim();
+  const countyQ = filters.county?.trim();
+  const nameQ = filters.q?.trim();
+  const needsFilter = Boolean(cityQ || countyQ || nameQ);
+
+  let facilities: Facility[];
+  let total: number;
+  let insufficientCount = meta?.nInsufficient ?? 0;
+
+  if (!needsFilter) {
+    // Fast path: page directly from ZSET
+    total = meta?.nScored ?? zcard;
+    if (!total) return null;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const safePage = Math.min(Math.max(1, page), totalPages);
+    const start = (safePage - 1) * pageSize;
+    const end = start + pageSize - 1;
+    const ids = (await r.zrange(zkey, start, end, { rev: true })) as string[];
+    facilities = await loadFacilitiesByIds(r, buildId, ids);
+    const scoredCount = facilities.filter((f) => f.fraudChance != null).length;
+    return {
+      facilities,
+      meta: {
+        awardCount: meta?.facilityCount ?? total,
+        facilityCount: total,
+        scoredCount,
+        insufficientCount,
+        filters,
+        disclaimer: DISCLAIMER,
+        transactionCount: 0,
+        page: safePage,
+        pageSize,
+        totalPages,
+        hasMore: safePage < totalPages,
+        cache: { awards: true, transactions: true, response: true },
+        bulk: {
+          buildId,
+          mode: "bulk",
+          nScored: meta?.nScored ?? total,
+        },
+      },
+    };
+  }
+
+  // City / county / name: load full ranked id list, hydrate, filter, then page.
+  // Still Redis-only — no USAspending/FAC.
+  const allIds = (await r.zrange(zkey, 0, -1, { rev: true })) as string[];
+  if (!allIds.length) return null;
+
+  const allFacs = await loadFacilitiesByIds(r, buildId, allIds);
+  const filtered = allFacs.filter(
+    (f) =>
+      matchesPlace(f.city, cityQ) &&
+      matchesPlace(f.county, countyQ) &&
+      matchesName(f.name, nameQ),
+  );
+
+  total = filtered.length;
+  // Ranking list is scored-only; insufficient count not in ZSET
+  insufficientCount = 0;
+
+  if (total === 0) {
+    // Valid bulk coverage but no geo/name match — empty result, not legacy fallback
+    return {
+      facilities: [],
+      meta: {
+        awardCount: meta?.facilityCount ?? 0,
+        facilityCount: 0,
+        scoredCount: 0,
+        insufficientCount: 0,
+        filters,
+        disclaimer: DISCLAIMER,
+        transactionCount: 0,
+        page: 1,
+        pageSize,
+        totalPages: 1,
+        hasMore: false,
+        cache: { awards: true, transactions: true, response: true },
+        bulk: {
+          buildId,
+          mode: "bulk",
+          nScored: meta?.nScored ?? 0,
+        },
+      },
+    };
+  }
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(Math.max(1, page), totalPages);
   const start = (safePage - 1) * pageSize;
-  const end = start + pageSize - 1;
-
-  const ids = (await r.zrange(zkey, start, end, {
-    rev: true,
-  })) as string[];
-
-  const facilities: Facility[] = [];
-  for (const id of ids) {
-    const fac = await r.get<Facility>(bulkFacKey(buildId, id));
-    if (fac) facilities.push(fac);
-  }
-
+  facilities = filtered.slice(start, start + pageSize);
   const scoredCount = facilities.filter((f) => f.fraudChance != null).length;
 
   return {
@@ -343,7 +469,7 @@ export async function getFacilitiesFromBulk(
       awardCount: meta?.facilityCount ?? total,
       facilityCount: total,
       scoredCount,
-      insufficientCount: meta?.nInsufficient ?? 0,
+      insufficientCount,
       filters,
       disclaimer: DISCLAIMER,
       transactionCount: 0,
@@ -351,11 +477,7 @@ export async function getFacilitiesFromBulk(
       pageSize,
       totalPages,
       hasMore: safePage < totalPages,
-      cache: {
-        awards: true,
-        transactions: true,
-        response: true,
-      },
+      cache: { awards: true, transactions: true, response: true },
       bulk: {
         buildId,
         mode: "bulk",
