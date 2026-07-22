@@ -194,15 +194,6 @@ export default function App() {
               <> ({meta.scoredCount} scored)</>
             ) : null}
             .
-            {meta.cache?.response ? (
-              <span className="text-stone-400"> · cached</span>
-            ) : null}
-            {" "}
-            <span className="text-stone-400">
-              {meta.bulk
-                ? "Offline bulk ranking (USAspending archive + FAC). Ranked by audit-worthiness among recipients with enough grant history in this state/type. “Insufficient data” means too few amounts to rank reliably."
-                : "Ranked by audit-worthiness among facilities in this search. Grant counts marked · sample are from the live sample."}
-            </span>
           </p>
         )}
 
