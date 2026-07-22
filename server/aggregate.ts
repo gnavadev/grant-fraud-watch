@@ -35,6 +35,16 @@ import {
   extractCfdaFromAward,
   fetchCfdaBaseline,
 } from "./usaspending.js";
+import { usaspendingRecipientIdFromUei } from "./usaspendingRecipientId.js";
+
+/** Prefer live award recipient_id hash; else compute from UEI (no HTTP). */
+function resolveRecipientId(
+  id: string,
+  uei: string | null | undefined,
+): string | null {
+  if (id && !id.startsWith("name:")) return id;
+  return usaspendingRecipientIdFromUei(uei ?? "", "C");
+}
 
 interface MutableFacility {
   id: string;
@@ -419,7 +429,7 @@ export async function aggregateAwardsToFacilities(
         primaryCfda: cfda ?? cached.primaryCfda,
         awardTypes: types,
         uei: m.uei ?? cached.uei,
-        recipientId: m.id.startsWith("name:") ? null : m.id,
+        recipientId: resolveRecipientId(m.id, m.uei ?? cached.uei),
         benfordEligible: features.n >= 3,
         enrichment: cached.enrichment,
         rescore: {
@@ -497,7 +507,7 @@ export async function aggregateAwardsToFacilities(
       primaryCfda: cfda,
       awardTypes: types,
       uei: m.uei,
-      recipientId: m.id.startsWith("name:") ? null : m.id,
+      recipientId: resolveRecipientId(m.id, m.uei),
       benfordEligible: multi.benfordEligible,
       enrichment: {
         fac: fac

@@ -84,7 +84,7 @@ function slimFacilityForRedis(b: BulkScoredFacility): Facility {
     primaryCfda: b.primaryCfda,
     awardTypes: [],
     uei: b.uei,
-    recipientId: null,
+    recipientId: b.recipientId ?? null,
     benfordEligible: b.benfordEligible,
     enrichment: {
       fac: b.enrichment?.fac

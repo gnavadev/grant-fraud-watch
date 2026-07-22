@@ -13,7 +13,7 @@
     "build": "npm run build:client && npm run build:server",
     "start": "node dist/index.js",
     "start:dev": "tsx server/index.ts",
-    "test": "tsx server/benford.test.ts && tsx server/location.test.ts && tsx server/links.test.ts && tsx server/logger.test.ts && tsx server/samExtract.test.ts && tsx server/samEntityExtract.test.ts",
+    "test": "tsx server/benford.test.ts && tsx server/location.test.ts && tsx server/links.test.ts && tsx server/logger.test.ts && tsx server/samExtract.test.ts && tsx server/samEntityExtract.test.ts && tsx server/usaspendingRecipientId.test.ts",
     "test:benford": "tsx server/benford.test.ts",
     "sam:sync": "tsx server/samExtractSync.ts all",
     "sam:sync-exclusions": "tsx server/samExtractSync.ts exclusions",

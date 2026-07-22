@@ -10,6 +10,7 @@ import type { FacAuditSummary } from "./fac.js";
 import { computeMultiSignalScore } from "./multiSignal.js";
 import { getEntityFromExtract } from "./samEntityExtract.js";
 import { isUeiExcluded } from "./samExtract.js";
+import { usaspendingRecipientIdFromUei } from "./usaspendingRecipientId.js";
 import type {
   Facility,
   FacilityTypeKey,
@@ -98,6 +99,8 @@ export interface BulkScoreConfig {
 export interface BulkScoredFacility {
   id: string;
   uei: string | null;
+  /** Deterministic USAspending profile id (md5 UUID + -C); no API. */
+  recipientId?: string | null;
   name: string;
   city: string | null;
   county: string | null;
@@ -450,6 +453,7 @@ export async function scoreAllFromDuck(
       facilities.push({
         id: uei,
         uei,
+        recipientId: usaspendingRecipientIdFromUei(uei, "C"),
         name,
         city: r.city != null ? String(r.city) : null,
         county: r.county != null ? String(r.county) : null,
@@ -543,7 +547,7 @@ export function bulkToFacility(b: BulkScoredFacility): Facility {
     primaryCfda: b.primaryCfda,
     awardTypes: [],
     uei: b.uei,
-    recipientId: null,
+    recipientId: b.recipientId ?? usaspendingRecipientIdFromUei(b.uei ?? "", "C"),
     benfordEligible: b.benfordEligible,
     enrichment: b.enrichment,
     rescore: {
