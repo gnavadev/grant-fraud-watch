@@ -100,8 +100,9 @@ data/bulk/raw/usa_extracted/
       db.all(sql, (err, rows) => (err ? reject(err) : resolve(rows)));
     });
 
-  // FAC if present
+  // FAC if present (general + optional findings counts by report_id)
   const facGeneral = path.join(root, "raw", "fac", "general.csv");
+  const facFindings = path.join(root, "raw", "fac", "findings.csv");
   if (fs.existsSync(facGeneral)) {
     console.log("Loading FAC general.csv …");
     await run(`
@@ -109,19 +110,59 @@ data/bulk/raw/usa_extracted/
       SELECT * FROM read_csv_auto('${facGeneral.replace(/\\/g, "/")}',
         header=true, ignore_errors=true, sample_size=-1);
     `);
+
+    if (fs.existsSync(facFindings)) {
+      console.log("Loading FAC findings.csv (counts by report_id) …");
+      await run(`
+        CREATE OR REPLACE TABLE fac_findings AS
+        SELECT * FROM read_csv_auto('${facFindings.replace(/\\/g, "/")}',
+          header=true, ignore_errors=true, sample_size=-1);
+      `);
+      // Column name is typically report_id (same as API / general)
+      await run(`
+        CREATE OR REPLACE TABLE fac_findings_by_report AS
+        SELECT
+          CAST(report_id AS VARCHAR) AS report_id,
+          COUNT(*)::BIGINT AS findings_count
+        FROM fac_findings
+        WHERE report_id IS NOT NULL
+        GROUP BY 1;
+      `);
+      const nf = (await all("SELECT COUNT(*) AS c FROM fac_findings_by_report"))[0]
+        .c;
+      console.log(`  fac_findings_by_report rows: ${nf}`);
+    } else {
+      console.log("No findings.csv — findings_count will default to 0");
+      await run(`
+        CREATE OR REPLACE TABLE fac_findings_by_report AS
+        SELECT CAST(NULL AS VARCHAR) AS report_id, 0::BIGINT AS findings_count
+        WHERE 1=0;
+      `);
+    }
+
     await run(`
       CREATE OR REPLACE TABLE fac_latest AS
       SELECT * EXCLUDE (rn) FROM (
-        SELECT *,
+        SELECT
+          g.*,
+          COALESCE(fc.findings_count, 0) AS findings_count,
           ROW_NUMBER() OVER (
-            PARTITION BY auditee_uei ORDER BY TRY_CAST(audit_year AS INTEGER) DESC NULLS LAST
+            PARTITION BY g.auditee_uei
+            ORDER BY TRY_CAST(g.audit_year AS INTEGER) DESC NULLS LAST
           ) AS rn
-        FROM fac_general
-        WHERE auditee_uei IS NOT NULL AND CAST(auditee_uei AS VARCHAR) <> ''
+        FROM fac_general g
+        LEFT JOIN fac_findings_by_report fc
+          ON CAST(g.report_id AS VARCHAR) = fc.report_id
+        WHERE g.auditee_uei IS NOT NULL AND CAST(g.auditee_uei AS VARCHAR) <> ''
       ) t WHERE rn = 1;
     `);
     const n = (await all("SELECT COUNT(*) AS c FROM fac_latest"))[0].c;
-    console.log(`  fac_latest rows: ${n}`);
+    const withF = (
+      await all(
+        "SELECT COUNT(*) AS c FROM fac_latest WHERE findings_count > 0",
+      )
+    )[0].c;
+    console.log(`  fac_latest rows: ${n} (with findings_count>0: ${withF})`);
   } else {
     console.log("No FAC general.csv yet — run npm run bulk:download-fac");
   }

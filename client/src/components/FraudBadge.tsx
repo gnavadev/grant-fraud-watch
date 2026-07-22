@@ -60,19 +60,21 @@ export function FraudBadge({ facility }: Props) {
     );
   }
 
-  if (facility.fraudChance == null || facility.confidence === "none") {
+  if (facility.fraudLabel === "insufficient" || facility.fraudChance == null || facility.confidence === "none") {
     return (
       <span
         className="inline-flex items-center rounded-full bg-stone-100 px-2.5 py-1 text-xs font-medium text-stone-600 ring-1 ring-inset ring-stone-200"
         title={
           facility.failReasons?.join(" · ") ||
-          "Not enough data to score this facility."
+          "Insufficient grant amount history to rank (need more nonzero obligations in the bulk window)."
         }
       >
-        N/A
+        Insufficient data
       </span>
     );
   }
+
+  const excluded = facility.enrichment?.sam?.excluded === true;
 
   const riskStyles =
     facility.fraudLabel === "low"
@@ -92,14 +94,22 @@ export function FraudBadge({ facility }: Props) {
     facility.failReasons && facility.failReasons.length > 0
       ? ` · ${facility.failReasons.join(" · ")}`
       : "";
+  const excludeNote = excluded
+    ? " · SAM exclusion list (admin floor applied; not a statistical prediction)"
+    : "";
 
   return (
     <span
       className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ring-inset ${riskStyles}`}
-      title={`Audit-worthiness score, not proof of fraud.${partialNote}`}
+      title={`Audit-worthiness score, not proof of fraud.${partialNote}${excludeNote}`}
     >
       <span className="tabular-nums">{formatPercent(facility.fraudChance)}</span>
       <span className="font-medium opacity-80">{riskLabel}</span>
+      {excluded ? (
+        <span className="font-medium opacity-90" title="On SAM public exclusion list">
+          · SAM excl.
+        </span>
+      ) : null}
     </span>
   );
 }

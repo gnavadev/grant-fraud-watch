@@ -190,21 +190,10 @@ export function scoreRecipient(input: {
   const features = extractAmountFeatures(scoreAmounts);
   const benfordDetail = scoreAmountsWithBenford(scoreAmounts);
 
-  const sam = input.excluded
-    ? {
-        uei: "",
-        found: true,
-        excluded: true,
-        exclusionCount: 1,
-        registrationDate: null,
-        registrationAgeDays: null,
-        registrationStatus: null,
-        riskScore: 85,
-        legalBusinessName: null,
-        source: "extract" as const,
-      }
-    : null;
-
+  // Statistical score: FAC + amount structure only.
+  // SAM exclusion is ground-truth admin status — applied as an explicit floor
+  // after the blend so (1) auditors still see excluded orgs as high priority and
+  // (2) we can validate the statistical score against exclusions separately.
   const multi = computeMultiSignalScore({
     scoreAmounts,
     features,
@@ -214,19 +203,39 @@ export function scoreRecipient(input: {
     usedTransactions: false,
     cfdaBaseline: null,
     fac: input.fac,
-    sam,
+    sam: null,
     subaward: null,
     temporal: null,
   });
 
+  let fraudChance = multi.multiScore;
+  let fraudLabel = fraudLabelFromChance(multi.multiScore);
+  let scoreMethod: ScoreMethod =
+    multi.multiScore != null ? "statistical" : "none";
+
+  // Documented admin override (not a latent feature weight):
+  // excluded UEI → floor at 90 so triage never buries debarred entities.
+  if (input.excluded) {
+    const floor = 90;
+    if (fraudChance == null || fraudChance < floor) {
+      fraudChance = floor;
+      fraudLabel = fraudLabelFromChance(fraudChance);
+      scoreMethod = "statistical";
+    }
+  }
+
   return {
-    fraudChance: multi.multiScore,
-    fraudLabel: fraudLabelFromChance(multi.multiScore),
+    fraudChance,
+    fraudLabel,
     confidence: multi.confidence,
-    scoreMethod: multi.multiScore != null ? "statistical" : "none",
-    multiScore: multi.multiScore,
+    scoreMethod,
+    multiScore: fraudChance,
     benfordScore: multi.signals.benford,
-    signals: multi.signals as SignalBreakdown,
+    signals: {
+      ...multi.signals,
+      // Surface exclusion as SAM signal for UI transparency
+      sam: input.excluded ? 85 : multi.signals.sam,
+    } as SignalBreakdown,
     avgAward: multi.avgAward,
     benfordEligible: multi.benfordEligible,
     features,

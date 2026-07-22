@@ -200,7 +200,7 @@ export default function App() {
             {" "}
             <span className="text-stone-400">
               {meta.bulk
-                ? "Offline bulk ranking (USAspending archive + FAC). Ranked by audit-worthiness among scored recipients in this state/type."
+                ? "Offline bulk ranking (USAspending archive + FAC). Ranked by audit-worthiness among recipients with enough grant history in this state/type. “Insufficient data” means too few amounts to rank reliably."
                 : "Ranked by audit-worthiness among facilities in this search. Grant counts marked · sample are from the live sample."}
             </span>
           </p>

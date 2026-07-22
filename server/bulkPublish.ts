@@ -56,11 +56,38 @@ async function main() {
     `state=${opts.onlyState ?? "ALL"} type=${opts.onlyType ?? "ALL"} minEvidenceN=${opts.minN}`,
   );
 
+  // If DB is over free 256MB quota, probe SET fails — purge first, then probe.
+  const { getRedis } = await import("./cache.js");
+  const { purgeRedisPrefixes } = await import("./bulkRedis.js");
+  if (!getRedis()) {
+    console.error("Redis not configured (UPSTASH_REDIS_REST_URL + TOKEN).");
+    process.exit(1);
+  }
+  console.log("Reclaiming Redis space (may take a minute if full)…");
+  const prePurge = await purgeRedisPrefixes(
+    [
+      "gfw:bulk:",
+      "gfw:sc:",
+      "gfw:facilities_v",
+      "gfw:awards_v",
+      "gfw:txns_",
+      "gfw:fac_",
+      "gfw:fac_lite_",
+      "gfw:grants_",
+      "gfw:",
+    ],
+    100_000,
+  );
+  console.log(`  pre-purge deleted ~${prePurge} keys`);
+
   const redis = await probeRedis();
   if (!redis.ok) {
     console.error(
-      "Redis required for publish:",
-      redis.error ?? "not configured",
+      "Redis still not writable after purge:",
+      redis.error ?? "unknown",
+    );
+    console.error(
+      "Open Upstash console → flush DB or upgrade plan, then retry.",
     );
     process.exit(1);
   }
@@ -92,7 +119,7 @@ async function main() {
   console.log("Publishing to Redis…");
   const pub = await publishBulkBuild(facilities);
   console.log(
-    `Published build=${pub.buildId} facKeys=${pub.facKeys} rankKeys=${pub.rankKeys}`,
+    `Published build=${pub.buildId} facKeys=${pub.facKeys} rankKeys=${pub.rankKeys} purged=${pub.purged}`,
   );
   console.log("Flipped gfw:bulk:current → this build.");
   console.log(

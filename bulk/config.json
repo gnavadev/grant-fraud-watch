@@ -7,6 +7,6 @@
   "preferAllAgenciesFile": true,
   "facBase": "https://app.fac.gov/dissemination/public-data/gsa/full",
   "facTables": ["general", "findings", "federal_awards"],
-  "minEvidenceN": 3,
+  "minEvidenceN": 5,
   "dataDir": "data/bulk"
 }

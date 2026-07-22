@@ -1,16 +1,15 @@
 /**
- * Publish / serve bulk scores via Upstash Redis.
+ * Publish / serve bulk scores via Upstash Redis (storage-tight for free 256MB).
  *
  * Keys:
  *   gfw:bulk:current              → buildId
- *   gfw:bulk:{build}:fac:{id}     → facility JSON (list payload)
+ *   gfw:bulk:{build}:fac:{id}     → slim facility JSON (scored only)
  *   gfw:bulk:{build}:rank:{ST}:{type} → ZSET member=id score=fraudChance
- *   gfw:bulk:{build}:meta:{ST}:{type} → { nScored, nInsufficient, builtAt }
- *   gfw:bulk:{build}:info         → { builtAt, fy, stats }
+ *   gfw:bulk:{build}:meta:{ST}:{type} → coverage meta
+ *   gfw:bulk:{build}:info         → build stats
  */
 import { getRedis } from "./cache.js";
 import type { BulkScoredFacility } from "./bulkScore.js";
-import { bulkToFacility } from "./bulkScore.js";
 import type {
   FacilitiesResponse,
   Facility,
@@ -55,25 +54,128 @@ export interface BulkRankMeta {
 const DISCLAIMER =
   "Audit-worthiness ranking from offline bulk awards (USAspending archive) + FAC dissemination. Universe: assistance awards types 02–05 in loaded fiscal years. Not proof of fraud.";
 
-function slimFac(f: Facility): Facility {
+/** Minimal list row — avoids bloating free Upstash (256MB). */
+function slimFacilityForRedis(b: BulkScoredFacility): Facility {
+  const emptyBenford = {
+    counts: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0 },
+    n: b.sampleCount,
+    mad: null as number | null,
+    chiSquare: null as number | null,
+  };
   return {
-    ...f,
-    rescore: f.rescore
-      ? {
-          ...f.rescore,
-          scoreAmounts: (f.rescore.scoreAmounts ?? []).slice(0, 40),
-        }
-      : undefined,
+    id: b.id,
+    name: b.name,
+    city: b.city,
+    county: b.county,
+    state: b.state,
+    grantReceived: b.grantReceived,
+    awardCount: b.awardCount,
+    grantsHydrated: true,
+    sampleCount: b.sampleCount,
+    fraudChance: b.fraudChance,
+    fraudLabel: b.fraudLabel,
+    confidence: b.confidence,
+    scoreMethod: b.scoreMethod,
+    scoreStatus: "ok",
+    benfordScore: b.benfordScore,
+    multiScore: b.multiScore,
+    signals: b.signals,
+    avgAward: b.avgAward,
+    primaryCfda: b.primaryCfda,
+    awardTypes: [],
+    uei: b.uei,
+    recipientId: null,
+    benfordEligible: b.benfordEligible,
+    enrichment: {
+      fac: b.enrichment?.fac
+        ? {
+            found: b.enrichment.fac.found,
+            riskScore: b.enrichment.fac.riskScore,
+            findingsCount: b.enrichment.fac.findingsCount,
+            materialWeakness: b.enrichment.fac.materialWeakness,
+            goingConcern: b.enrichment.fac.goingConcern,
+            lowRiskAuditee: b.enrichment.fac.lowRiskAuditee,
+            reportId: b.enrichment.fac.reportId ?? null,
+            auditYear: b.enrichment.fac.auditYear ?? null,
+          }
+        : null,
+      sam: b.enrichment?.sam
+        ? {
+            found: b.enrichment.sam.found,
+            riskScore: b.enrichment.sam.riskScore,
+            excluded: b.enrichment.sam.excluded,
+            registrationAgeDays: b.enrichment.sam.registrationAgeDays,
+            legalBusinessName: null,
+          }
+        : null,
+      subaward: null,
+      temporal: null,
+    },
+    benford: (b.benford ?? emptyBenford) as Facility["benford"],
+    features: {
+      n: b.sampleCount,
+      sum: b.grantReceived,
+      mean: b.avgAward ?? 0,
+      std: 0,
+      median: 0,
+      min: 0,
+      max: 0,
+      cv: 0,
+      maxToMean: 0,
+      pctRound: 0,
+      pctNegative: 0,
+      logSum: 0,
+      logMean: 0,
+      digitEntropy: 0,
+      benfordMad: 0,
+      benfordChi: 0,
+    },
+    deepScored: false,
   };
 }
 
 /**
- * Write a full build to Redis and flip scores:current.
+ * Delete keys matching prefix patterns (free-tier reclaim).
+ * Uses SCAN; best-effort.
+ */
+export async function purgeRedisPrefixes(
+  prefixes: string[],
+  maxDelete = 50_000,
+): Promise<number> {
+  const r = getRedis();
+  if (!r) return 0;
+  let deleted = 0;
+  for (const p of prefixes) {
+    let cursor: string | number = 0;
+    do {
+      const res = (await r.scan(cursor, {
+        match: `${p}*`,
+        count: 200,
+      })) as [string | number, string[]];
+      cursor = res[0];
+      const keys = res[1] ?? [];
+      if (keys.length) {
+        // del in small batches
+        for (let i = 0; i < keys.length; i += 50) {
+          const chunk = keys.slice(i, i + 50);
+          await r.del(...chunk);
+          deleted += chunk.length;
+          if (deleted >= maxDelete) return deleted;
+        }
+      }
+    } while (String(cursor) !== "0");
+  }
+  return deleted;
+}
+
+/**
+ * Write a full build to Redis and flip bulk:current.
+ * Only stores **scored** facilities (not insufficient) to fit free tier.
  */
 export async function publishBulkBuild(
   facilities: BulkScoredFacility[],
-  opts?: { buildId?: string; retainPrevious?: boolean },
-): Promise<{ buildId: string; rankKeys: number; facKeys: number }> {
+  opts?: { buildId?: string; purgeLegacy?: boolean },
+): Promise<{ buildId: string; rankKeys: number; facKeys: number; purged: number }> {
   const r = getRedis();
   if (!r) {
     throw new Error(
@@ -81,53 +183,50 @@ export async function publishBulkBuild(
     );
   }
 
+  // Space already reclaimed in bulkPublish pre-purge; optional second pass
+  let purged = 0;
+  if (opts?.purgeLegacy === true) {
+    purged = await purgeRedisPrefixes(["gfw:bulk:", "gfw:"], 20_000);
+  }
+
   const buildId =
     opts?.buildId ??
     new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const ttlSec = 30 * 24 * 3600; // 30 days
+  const ttlSec = 21 * 24 * 3600; // 21 days
 
-  // Group into rank keys
   const ranks = new Map<string, { id: string; score: number }[]>();
   const metaAcc = new Map<
     string,
     { scored: number; insufficient: number; total: number }
   >();
 
+  // Only persist detail hashes for rankable (scored) orgs
+  const scoredOnly = facilities.filter(
+    (b) => !b.insufficient && b.fraudChance != null,
+  );
+
   let facKeys = 0;
-  const pipeline: Promise<unknown>[] = [];
+  const pending: Promise<unknown>[] = [];
 
-  for (const b of facilities) {
-    const fac = slimFac(bulkToFacility(b));
-    const facKey = bulkFacKey(buildId, b.id);
-    pipeline.push(r.set(facKey, fac, { ex: ttlSec }));
+  async function flush() {
+    if (!pending.length) return;
+    await Promise.all(pending);
+    pending.length = 0;
+  }
+
+  for (const b of scoredOnly) {
+    const fac = slimFacilityForRedis(b);
+    pending.push(r.set(bulkFacKey(buildId, b.id), fac, { ex: ttlSec }));
     facKeys += 1;
+    if (pending.length >= 25) await flush();
+  }
+  await flush();
 
-    // Flush pipeline periodically (Upstash REST is HTTP-per-call; batch await chunks)
-    if (pipeline.length >= 40) {
-      await Promise.all(pipeline);
-      pipeline.length = 0;
-    }
-
-    for (const type of b.types) {
+  // Build rank membership for ALL facilities (counts include insufficient)
+  for (const b of facilities) {
+    const typeList = [...new Set([...b.types, "all" as const])];
+    for (const type of typeList) {
       const rk = `${b.state}|${type}`;
-      if (!ranks.has(rk)) ranks.set(rk, []);
-      if (!metaAcc.has(rk)) {
-        metaAcc.set(rk, { scored: 0, insufficient: 0, total: 0 });
-      }
-      const m = metaAcc.get(rk)!;
-      m.total += 1;
-      if (b.insufficient || b.fraudChance == null) m.insufficient += 1;
-      else {
-        m.scored += 1;
-        ranks.get(rk)!.push({
-          id: b.id,
-          score: b.fraudChance,
-        });
-      }
-    }
-    // Also index under type "all"
-    {
-      const rk = `${b.state}|all`;
       if (!ranks.has(rk)) ranks.set(rk, []);
       if (!metaAcc.has(rk)) {
         metaAcc.set(rk, { scored: 0, insufficient: 0, total: 0 });
@@ -141,24 +240,19 @@ export async function publishBulkBuild(
       }
     }
   }
-  if (pipeline.length) await Promise.all(pipeline);
 
   let rankKeys = 0;
   for (const [rk, members] of ranks) {
     const [state, type] = rk.split("|");
     const zkey = bulkRankKey(buildId, state, type);
-    // Replace zset
     await r.del(zkey);
     if (members.length > 0) {
-      // Upstash zadd: zadd(key, { score, member }, ...)
-      const args: { score: number; member: string }[] = members.map((m) => ({
-        score: m.score,
-        member: m.id,
-      }));
-      // chunk zadd (Upstash requires at least one ScoreMember after key)
-      for (let i = 0; i < args.length; i += 100) {
-        const chunk = args.slice(i, i + 100);
-        if (chunk.length === 0) continue;
+      for (let i = 0; i < members.length; i += 80) {
+        const chunk = members.slice(i, i + 80).map((m) => ({
+          score: m.score,
+          member: m.id,
+        }));
+        if (!chunk.length) continue;
         const [first, ...rest] = chunk;
         await r.zadd(zkey, first, ...rest);
       }
@@ -182,16 +276,16 @@ export async function publishBulkBuild(
     {
       builtAt: new Date().toISOString(),
       recipients: facilities.length,
+      scoredStored: scoredOnly.length,
       rankKeys,
       facKeys,
     },
     { ex: ttlSec },
   );
 
-  // Atomic cutover
   await r.set(bulkCurrentKey(), buildId);
 
-  return { buildId, rankKeys, facKeys };
+  return { buildId, rankKeys, facKeys, purged };
 }
 
 export async function getBulkBuildId(): Promise<string | null> {
@@ -201,9 +295,6 @@ export async function getBulkBuildId(): Promise<string | null> {
   return v ? String(v) : null;
 }
 
-/**
- * Serve a ranked page from Redis bulk build. Returns null if no build / no rank key.
- */
 export async function getFacilitiesFromBulk(
   filters: FacilityFilters,
   page: number,
@@ -216,9 +307,8 @@ export async function getFacilitiesFromBulk(
   if (!buildId) return null;
 
   const state = filters.state?.trim().toUpperCase();
-  if (!state) return null; // bulk ranks are state-scoped
+  if (!state) return null;
 
-  // City / county / q: not supported as rank keys yet → fall back to legacy
   if (filters.city?.trim() || filters.county?.trim() || filters.q?.trim()) {
     return null;
   }
@@ -226,11 +316,6 @@ export async function getFacilitiesFromBulk(
   const type: FacilityTypeKey | string = filters.type ?? "all";
   const zkey = bulkRankKey(buildId, state, type);
   const meta = await r.get<BulkRankMeta>(bulkMetaKey(buildId, state, type));
-  if (!meta || meta.nScored === 0) {
-    // Try existence of zset
-    const card = await r.zcard(zkey);
-    if (!card) return null;
-  }
 
   const total = meta?.nScored ?? (await r.zcard(zkey)) ?? 0;
   if (!total) return null;
@@ -240,7 +325,6 @@ export async function getFacilitiesFromBulk(
   const start = (safePage - 1) * pageSize;
   const end = start + pageSize - 1;
 
-  // Highest fraud chance first
   const ids = (await r.zrange(zkey, start, end, {
     rev: true,
   })) as string[];
