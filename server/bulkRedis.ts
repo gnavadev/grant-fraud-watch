@@ -56,11 +56,45 @@ const DISCLAIMER =
 
 /** Minimal list row — avoids bloating free Upstash (256MB). */
 function slimFacilityForRedis(b: BulkScoredFacility): Facility {
-  const emptyBenford = {
-    counts: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0 },
+  // Keep real min/mean/max (+ rest of AmountFeatures) for deep-dive "How big are
+  // the amounts?" — these are ~15 numbers, not full award lists.
+  // Keep Benford digitCounts for the digit chart (9 ints). Never ship amounts[].
+  const features = b.features ?? {
     n: b.sampleCount,
-    mad: null as number | null,
-    chiSquare: null as number | null,
+    sum: b.grantReceived,
+    mean: b.avgAward ?? 0,
+    std: 0,
+    median: 0,
+    min: 0,
+    max: 0,
+    cv: 0,
+    maxToMean: 0,
+    pctRound: 0,
+    pctNegative: 0,
+    logSum: 0,
+    logMean: 0,
+    digitEntropy: 0,
+    benfordMad: 0,
+    benfordChi: 0,
+  };
+  const emptyDigitCounts: Record<string, number> = {
+    "1": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0,
+  };
+  const benford = b.benford ?? {
+    sampleSize: b.sampleCount,
+    chiSquare: null,
+    mad: null,
+    digitCounts: emptyDigitCounts,
+    minFullSample: 50,
+    minLowSample: 1,
   };
   return {
     id: b.id,
@@ -111,25 +145,8 @@ function slimFacilityForRedis(b: BulkScoredFacility): Facility {
       subaward: null,
       temporal: null,
     },
-    benford: (b.benford ?? emptyBenford) as Facility["benford"],
-    features: {
-      n: b.sampleCount,
-      sum: b.grantReceived,
-      mean: b.avgAward ?? 0,
-      std: 0,
-      median: 0,
-      min: 0,
-      max: 0,
-      cv: 0,
-      maxToMean: 0,
-      pctRound: 0,
-      pctNegative: 0,
-      logSum: 0,
-      logMean: 0,
-      digitEntropy: 0,
-      benfordMad: 0,
-      benfordChi: 0,
-    },
+    benford,
+    features,
     deepScored: false,
   };
 }
