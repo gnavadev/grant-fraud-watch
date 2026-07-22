@@ -99,6 +99,20 @@ async function main() {
   } catch (e) {
     console.warn("SAM exclusions optional:", e);
   }
+  try {
+    const { ensureSamEntityIndex, getEntityExtractStatus } = await import(
+      "./samEntityExtract.js"
+    );
+    const ok = await ensureSamEntityIndex();
+    const st = await getEntityExtractStatus();
+    console.log(
+      ok
+        ? `SAM entity extract ready (count≈${st.count}) — needed for SAM.gov links`
+        : "SAM entity extract NOT ready — most SAM links will stay grey (set SAM_ENTITY_DB_URL or run sam:sync-entities)",
+    );
+  } catch (e) {
+    console.warn("SAM entity extract optional:", e);
+  }
 
   console.log("Scoring from DuckDB (no HTTP)…");
   const t0 = Date.now();
@@ -108,8 +122,13 @@ async function main() {
     onlyType: opts.onlyType,
   });
   console.log(
-    `Scored in ${Date.now() - t0}ms: recipients=${stats.recipients} scored=${stats.scored} insufficient=${stats.insufficient} withFac=${stats.withFac}`,
+    `Scored in ${Date.now() - t0}ms: recipients=${stats.recipients} scored=${stats.scored} insufficient=${stats.insufficient} withFac=${stats.withFac} withSam=${stats.withSam}`,
   );
+  if (stats.withSam === 0) {
+    console.error(
+      "WARNING: withSam=0 — SAM entity extract not loaded. SAM links will all stay grey. Fix: ensure .cache/sam/entities.sqlite exists (npm run sam:sync-entities or SAM_ENTITY_DB_URL).",
+    );
+  }
 
   if (facilities.length === 0) {
     console.error("No facilities scored. Run npm run bulk:load first.");

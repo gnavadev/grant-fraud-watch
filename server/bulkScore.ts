@@ -8,6 +8,7 @@ import { openBulkDuck, type DuckConn } from "./bulkDuck.js";
 import { extractAmountFeatures } from "./features.js";
 import type { FacAuditSummary } from "./fac.js";
 import { computeMultiSignalScore } from "./multiSignal.js";
+import { getEntityFromExtract } from "./samEntityExtract.js";
 import { isUeiExcluded } from "./samExtract.js";
 import type {
   Facility,
@@ -17,6 +18,44 @@ import type {
   ScoreMethod,
   SignalBreakdown,
 } from "./types.js";
+
+function daysSince(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  return Math.floor((Date.now() - t) / (24 * 60 * 60 * 1000));
+}
+
+function ageRisk(days: number | null): number {
+  if (days == null) return 0;
+  if (days < 90) return 70;
+  if (days < 180) return 50;
+  if (days < 365) return 30;
+  if (days < 730) return 12;
+  return 0;
+}
+
+/** Public SAM summary from local extracts (exclusions + entity sqlite). */
+function samFromExtracts(uei: string): {
+  found: boolean;
+  excluded: boolean;
+  riskScore: number;
+  registrationAgeDays: number | null;
+  legalBusinessName: string | null;
+} {
+  const excluded = isUeiExcluded(uei) === true;
+  const entity = getEntityFromExtract(uei);
+  const age = daysSince(entity?.registrationDate ?? null);
+  let riskScore = ageRisk(age);
+  if (excluded) riskScore = Math.min(100, riskScore + 85);
+  return {
+    found: Boolean(entity) || excluded,
+    excluded,
+    riskScore: Math.min(100, riskScore),
+    registrationAgeDays: age,
+    legalBusinessName: entity?.legalBusinessName ?? null,
+  };
+}
 
 export interface BulkScoreConfig {
   minEvidenceN: number;
@@ -256,6 +295,7 @@ export async function scoreAllFromDuck(
     scored: number;
     insufficient: number;
     withFac: number;
+    withSam: number;
   };
 }> {
   const own = !conn;
@@ -292,6 +332,7 @@ export async function scoreAllFromDuck(
     let scored = 0;
     let insufficient = 0;
     let withFac = 0;
+    let withSam = 0;
 
     // Prefetch FAC map
     const facRows = await db.all<Record<string, unknown>>(`
@@ -342,17 +383,28 @@ export async function scoreAllFromDuck(
       const fac = facFromRow(uei, facRow);
       if (fac) withFac += 1;
 
-      let excluded = false;
+      let samInfo = {
+        found: false,
+        excluded: false,
+        riskScore: 0,
+        registrationAgeDays: null as number | null,
+        legalBusinessName: null as string | null,
+      };
       try {
-        excluded = isUeiExcluded(uei) === true;
-      } catch {
-        excluded = false;
+        samInfo = samFromExtracts(uei);
+      } catch (err) {
+        console.warn(
+          "[bulkScore] SAM extract lookup failed",
+          uei,
+          err instanceof Error ? err.message : err,
+        );
       }
+      if (samInfo.found) withSam += 1;
 
       const scoredParts = scoreRecipient({
         amounts,
         fac,
-        excluded,
+        excluded: samInfo.excluded,
       });
 
       if (insufficientRow) {
@@ -401,13 +453,15 @@ export async function scoreAllFromDuck(
                 auditYear: fac.auditYear,
               }
             : null,
-          sam: excluded
+          // found=true only when public entity extract or exclusion list has UEI
+          // → UI greys SAM links when found=false (opt-out / not in extract)
+          sam: samInfo.found
             ? {
                 found: true,
-                riskScore: 85,
-                excluded: true,
-                registrationAgeDays: null,
-                legalBusinessName: null,
+                riskScore: samInfo.riskScore,
+                excluded: samInfo.excluded,
+                registrationAgeDays: samInfo.registrationAgeDays,
+                legalBusinessName: samInfo.legalBusinessName,
               }
             : null,
           subaward: null,
@@ -426,6 +480,7 @@ export async function scoreAllFromDuck(
         scored,
         insufficient,
         withFac,
+        withSam,
       },
     };
   } finally {

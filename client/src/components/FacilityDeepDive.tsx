@@ -292,12 +292,12 @@ export function FacilityDeepDive({ facility: f, onClose }: Props) {
                 <strong className="text-stone-900">SAM.gov registration:</strong>{" "}
                 {f.enrichment?.sam?.found
                   ? f.enrichment.sam.excluded
-                    ? "Listed on an exclusion list (high priority)."
+                    ? "Listed on a public exclusion list (high priority)."
                     : f.enrichment.sam.registrationAgeDays != null
                       ? `Registered about ${Math.round(f.enrichment.sam.registrationAgeDays / 365)} year(s) (age in days: ${f.enrichment.sam.registrationAgeDays}).`
-                      : "Entity found; no exclusion flag in our summary."
+                      : "Public SAM entity on file; no exclusion flag."
                   : f.uei
-                    ? "Company opted out of public display, or no public SAM registration match for this UEI."
+                    ? "Not in our public SAM entity extract (opted out of public display, expired, or not registered). SAM link stays disabled."
                     : "No UEI available for SAM lookup."}
               </li>
               <li className="rounded-lg border border-stone-100 px-3 py-2">
