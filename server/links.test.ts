@@ -26,7 +26,7 @@ function baseFacility(over: Partial<Facility> = {}): Facility {
     benfordScore: null,
     multiScore: 40,
     uei: "GN32L2K6ZE88",
-    recipientId: "rec-1",
+    recipientId: "4e05ba89-8df7-4eeb-0f35-e5b880ee03e4-C",
     primaryCfda: "93.600",
     benford: {
       sampleSize: 5,
@@ -113,6 +113,34 @@ assert(facDisabled?.href == null, "no FAC href without report");
 assert(
   !linksNo.some((l) => l.label.toLowerCase().includes("paste")),
   "no paste UEI link",
+);
+
+// USAspending: real hash → profile; UEI alone → search (never invent UEI-R)
+const usaProfile = linksFac.find((l) => l.label === "USAspending facility profile");
+assert(usaProfile?.available === true, "USAspending profile when hash present");
+assert(
+  usaProfile?.href?.includes("4e05ba89-8df7-4eeb-0f35-e5b880ee03e4-C") === true,
+  "profile uses recipient hash",
+);
+const ueiOnly = facilityLinks(
+  baseFacility({ recipientId: null, uei: "CF2QLVHJTBD7" }),
+);
+const usaSearch = ueiOnly.find((l) => l.label.startsWith("USAspending"));
+assert(usaSearch?.label === "USAspending search (UEI)", "UEI falls back to search");
+assert(
+  usaSearch?.href?.includes("keyword=CF2QLVHJTBD7") === true,
+  "search by UEI keyword",
+);
+assert(
+  !ueiOnly.some((l) => l.href?.includes("CF2QLVHJTBD7-R")),
+  "never invent UEI-R profile URL",
+);
+const fakeHash = facilityLinks(
+  baseFacility({ recipientId: "CF2QLVHJTBD7-R", uei: "CF2QLVHJTBD7" }),
+);
+assert(
+  !fakeHash.some((l) => l.href?.includes("/recipient/CF2QLVHJTBD7-R/")),
+  "reject UEI-R as recipientId",
 );
 
 // SAM found vs not

@@ -8,6 +8,18 @@ export interface FacilityLink {
   available: boolean;
 }
 
+/**
+ * USAspending profile IDs are internal hashes ending in -C (child) or -R (recipient),
+ * e.g. 4e05ba89-8df7-4eeb-0f35-e5b880ee03e4-C.
+ * They are NOT `${UEI}-R` — that form always 404s as "Invalid Recipient".
+ */
+export function isUsaspendingRecipientHash(id: string | null | undefined): boolean {
+  const s = (id ?? "").trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[CR]$/i.test(
+    s,
+  );
+}
+
 /** Official links aimed at this specific facility (UEI / recipient id when known). */
 export function facilityLinks(f: Facility): FacilityLink[] {
   const links: FacilityLink[] = [];
@@ -18,19 +30,20 @@ export function facilityLinks(f: Facility): FacilityLink[] {
   const reportId = f.enrichment?.fac?.reportId?.trim() || null;
   const samFound = Boolean(f.enrichment?.sam?.found);
 
-  // USAspending, prefer direct recipient profile
-  if (recipientId) {
+  // USAspending: only use /recipient/{id}/ when id is a real hash (-C/-R).
+  // Bulk ranking stores UEI only (no archive hash) → keyword search by UEI.
+  if (isUsaspendingRecipientHash(recipientId)) {
     links.push({
       label: "USAspending facility profile",
-      href: `https://www.usaspending.gov/recipient/${encodeURIComponent(recipientId)}/latest`,
+      href: `https://www.usaspending.gov/recipient/${encodeURIComponent(recipientId!)}/latest`,
       description: "Federal awards for this recipient",
       available: true,
     });
   } else if (uei) {
     links.push({
-      label: "USAspending facility profile",
-      href: `https://www.usaspending.gov/recipient/${encodeURIComponent(uei)}-R/latest`,
-      description: "Federal awards for this UEI",
+      label: "USAspending search (UEI)",
+      href: `https://www.usaspending.gov/search/?hash=false&keyword=${encodeURIComponent(uei)}`,
+      description: `Search federal awards for UEI ${uei}`,
       available: true,
     });
   } else {
