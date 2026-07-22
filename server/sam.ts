@@ -177,17 +177,29 @@ function summaryFromLiveEntity(
   const age = daysSince(regDate);
   const flagExcluded = isExcludedFlag(reg.exclusionStatusFlag);
   const excluded = extractExcluded === true || flagExcluded;
+  const liveStatus = (reg.registrationStatus ?? "").trim().toUpperCase();
+  // Live path: only treat as publicly "found" when registration is Active (or excluded)
+  const isActive =
+    liveStatus === "A" ||
+    liveStatus === "ACTIVE" ||
+    liveStatus === "ACTIVE REGISTRATION";
+  const publicDisplay = String(
+    (reg as { publicDisplayFlag?: string }).publicDisplayFlag ?? "Y",
+  )
+    .trim()
+    .toUpperCase();
+  const displayOk = publicDisplay !== "N" && publicDisplay !== "NPDY";
 
-  let riskScore = ageRisk(age);
+  let riskScore = isActive ? ageRisk(age) : 0;
   if (excluded) riskScore = Math.min(100, riskScore + 85);
 
   return {
     uei: clean,
-    found: true,
+    found: (isActive && displayOk) || excluded,
     excluded,
     exclusionCount: excluded ? 1 : 0,
-    registrationDate: regDate,
-    registrationAgeDays: age,
+    registrationDate: isActive ? regDate : null,
+    registrationAgeDays: isActive ? age : null,
     registrationStatus: reg.registrationStatus ?? reg.ueiStatus ?? null,
     riskScore: Math.min(100, riskScore),
     legalBusinessName: reg.legalBusinessName ?? null,
@@ -327,23 +339,44 @@ export async function ensureSamExtractsReady(): Promise<void> {
   await extractsReadyPromise;
 }
 
+function todayIsoUtc(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/** Active on public extract only if status A/Active and expiration not past. */
+function isCurrentlyActiveRegistration(entity: {
+  registrationStatus: string | null;
+  expirationDate: string | null;
+} | null): boolean {
+  if (!entity) return false;
+  const status = (entity.registrationStatus ?? "").trim().toUpperCase();
+  if (status !== "A" && status !== "ACTIVE") return false;
+  const exp = (entity.expirationDate ?? "").trim();
+  if (exp && exp < todayIsoUtc()) return false;
+  return true;
+}
+
 function summaryFromExtracts(clean: string): SamEntitySummary {
   const extractExcluded = isUeiExcluded(clean);
   const entityRow = getEntityFromExtract(clean);
   const excluded = extractExcluded === true;
+  const isActive = isCurrentlyActiveRegistration(entityRow);
   const regDate = entityRow?.registrationDate ?? null;
   const age = daysSince(regDate);
-  let riskScore = ageRisk(age);
+  // Align with bulk: public SAM links only for currently Active or exclusions
+  let riskScore = isActive ? ageRisk(age) : 0;
   if (excluded) riskScore = Math.min(100, riskScore + 85);
 
   return {
     uei: clean,
-    found: Boolean(entityRow) || excluded,
+    found: isActive || excluded,
     excluded,
     exclusionCount: excluded ? 1 : 0,
-    registrationDate: regDate,
-    registrationAgeDays: age,
-    registrationStatus: entityRow?.registrationStatus ?? null,
+    registrationDate: isActive ? regDate : null,
+    registrationAgeDays: isActive ? age : null,
+    registrationStatus: isActive
+      ? entityRow?.registrationStatus ?? "A"
+      : entityRow?.registrationStatus ?? null,
     riskScore: Math.min(100, riskScore),
     legalBusinessName: entityRow?.legalBusinessName ?? null,
     source: "extract",

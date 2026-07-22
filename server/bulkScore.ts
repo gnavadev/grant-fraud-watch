@@ -35,7 +35,36 @@ function ageRisk(days: number | null): number {
   return 0;
 }
 
-/** Public SAM summary from local extracts (exclusions + entity sqlite). */
+/** YYYY-MM-DD today (UTC) for comparing extract expiration_date. */
+function todayIsoUtc(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * Public SAM "currently active registration" from local extract.
+ * Status A alone is not enough: monthly extract can still list rows whose
+ * registrationExpirationDate has already passed (API then says Inactive).
+ * Those must not get clickable Active entity links.
+ */
+function isCurrentlyActiveRegistration(entity: {
+  registrationStatus: string | null;
+  expirationDate: string | null;
+} | null): boolean {
+  if (!entity) return false;
+  const status = (entity.registrationStatus ?? "").trim().toUpperCase();
+  if (status !== "A" && status !== "ACTIVE") return false;
+  const exp = (entity.expirationDate ?? "").trim();
+  if (exp && exp < todayIsoUtc()) return false;
+  return true;
+}
+
+/**
+ * Public SAM summary from local extracts.
+ * `found` drives clickable SAM links — only when we expect a public sam.gov hit:
+ *   - currently active registration (status A/Active AND expiration not past), or
+ *   - UEI on public exclusions list
+ * Status E, expired-by-date, and missing rows stay found=false (grey link).
+ */
 function samFromExtracts(uei: string): {
   found: boolean;
   excluded: boolean;
@@ -45,14 +74,16 @@ function samFromExtracts(uei: string): {
 } {
   const excluded = isUeiExcluded(uei) === true;
   const entity = getEntityFromExtract(uei);
+  const isActive = isCurrentlyActiveRegistration(entity);
   const age = daysSince(entity?.registrationDate ?? null);
-  let riskScore = ageRisk(age);
+  // Age risk only for active regs (expired are not "new shell" signal the same way)
+  let riskScore = isActive ? ageRisk(age) : 0;
   if (excluded) riskScore = Math.min(100, riskScore + 85);
   return {
-    found: Boolean(entity) || excluded,
+    found: isActive || excluded,
     excluded,
     riskScore: Math.min(100, riskScore),
-    registrationAgeDays: age,
+    registrationAgeDays: isActive ? age : null,
     legalBusinessName: entity?.legalBusinessName ?? null,
   };
 }

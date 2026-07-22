@@ -116,9 +116,35 @@ assert(
 );
 
 // SAM found vs not
-const samOk = linksFac.find((l) => l.label.includes("SAM.gov entity"));
+const samOk = linksFac.find((l) => l.label.includes("SAM.gov entity search"));
 assert(samOk?.available === true, "SAM available when found");
+assert(
+  samOk?.href?.includes("status=") !== true ||
+    linksFac.some((l) => l.href?.includes("status=null")),
+  "entity coreData uses status=null",
+);
+const core = linksFac.find((l) => l.label === "SAM.gov entity information");
+assert(core?.href?.includes("status=null") === true, "coreData status=null");
+assert(!core?.href?.includes("status=active"), "no lowercase status=active");
 const samNo = linksNo.find((l) => l.label.startsWith("SAM.gov entity"));
 assert(samNo?.available === false, "SAM grayed when not found");
+
+// Exclusion-only: exclusions search + entity links
+const samExcl = baseFacility({
+  enrichment: {
+    fac: null,
+    sam: {
+      found: true,
+      riskScore: 85,
+      excluded: true,
+      registrationAgeDays: null,
+    },
+  },
+});
+const exclLink = facilityLinks(samExcl).find((l) =>
+  l.label.includes("exclusions"),
+);
+assert(exclLink?.available === true, "exclusion search when excluded");
+assert(exclLink?.href?.includes("index=ex") === true, "exclusions index");
 
 console.log("links tests passed");

@@ -42,18 +42,30 @@ export function facilityLinks(f: Facility): FacilityLink[] {
     });
   }
 
-  // SAM.gov, entity pages only when SAM returned a public match
+  // SAM.gov — only when bulk/extract expects a public hit (active reg or exclusion).
+  // Use status=null for entity coreData (official export / PDF style); status=active
+  // (lowercase) often 404s even for real Active records. Search by exact UEI, not name.
+  const samExcluded = Boolean(f.enrichment?.sam?.excluded);
   if (uei && samFound) {
+    if (samExcluded) {
+      links.push({
+        label: "SAM.gov exclusions search (UEI)",
+        href: `https://sam.gov/search/?index=ex&page=1&pageSize=25&sfm[simpleSearch][keywordRadio]=ALL&sfm[simpleSearch][keywordTags][0][key]=${encodeURIComponent(uei)}&sfm[simpleSearch][keywordTags][0][value]=${encodeURIComponent(uei)}`,
+        description: `Public exclusion list search for UEI ${uei}`,
+        available: true,
+      });
+    }
     links.push({
-      label: "SAM.gov entity (UEI)",
-      href: `https://sam.gov/search/?index=ei&page=1&pageSize=25&sort=-modifiedDate&sfm[simpleSearch][keywordRadio]=ANY&sfm[simpleSearch][keywordTags][0][key]=${encodeURIComponent(uei)}&sfm[simpleSearch][keywordTags][0][value]=${encodeURIComponent(uei)}`,
-      description: `Registration / exclusions for UEI ${uei}`,
+      label: "SAM.gov entity search (UEI)",
+      href: `https://sam.gov/search/?index=ei&page=1&pageSize=25&sort=-relevance&sfm[simpleSearch][keywordRadio]=ALL&sfm[simpleSearch][keywordTags][0][key]=${encodeURIComponent(uei)}&sfm[simpleSearch][keywordTags][0][value]=${encodeURIComponent(uei)}`,
+      description: `Search entity information for UEI ${uei} (paste this UEI if the page is empty)`,
       available: true,
     });
+    // status=null is what GSA entity PDF exports use; works for Active public records
     links.push({
       label: "SAM.gov entity information",
-      href: `https://sam.gov/entity/${encodeURIComponent(uei)}/coreData?status=active`,
-      description: "Core entity record when published",
+      href: `https://sam.gov/entity/${encodeURIComponent(uei)}/coreData?status=null`,
+      description: "Core entity record (public display)",
       available: true,
     });
   } else if (uei) {
@@ -61,14 +73,14 @@ export function facilityLinks(f: Facility): FacilityLink[] {
       label: "SAM.gov entity",
       href: null,
       description:
-        "Not available, company opted out of public display or no public SAM match",
+        "Not available: no currently active public registration in our SAM extract (expired, opted out of public display, or not registered). Search manually by UEI if needed.",
       available: false,
     });
   } else {
     links.push({
       label: "SAM.gov search (this name)",
       href: `https://sam.gov/search/?index=ei&page=1&pageSize=25&sort=-relevance&sfm[simpleSearch][keywordRadio]=ALL&sfm[simpleSearch][keywordTags][0][key]=${nameQ}&sfm[simpleSearch][keywordTags][0][value]=${nameQ}`,
-      description: "Search registration by facility name",
+      description: "Search registration by facility name (name matches are weaker than UEI)",
       available: true,
     });
   }
