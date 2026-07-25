@@ -24,6 +24,8 @@ data/bulk/parquet/
 data/bulk/duckdb/
 data/bulk/probe/
 data/bulk/checkpoint.json
+# Uncompressed snapshot can be huge; prefer committing snapshot.json.gz
+data/bulk/snapshot.json
 tmp/
 temp/
 *.tmp

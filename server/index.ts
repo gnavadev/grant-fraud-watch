@@ -150,8 +150,11 @@ app.get("/api/health", async (_req, res) => {
       redisProbe.ok
         ? `Shared cache: Upstash Redis OK (${redisProbe.latencyMs ?? "?"}ms)`
         : redisProbe.configured
-          ? `Upstash configured but not working: ${redisProbe.error ?? "unknown"} (app falls back to disk; Data Browser stays empty)`
-          : "Cache: local disk only (set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN from Upstash REST API)",
+          ? `Upstash configured but not working: ${redisProbe.error ?? "unknown"} (bulk ranks use data/bulk/snapshot if present)`
+          : "Cache: local disk only (bulk ranks from data/bulk/snapshot.json.gz or BULK_SNAPSHOT_URL — Redis optional)",
+      bulkBuildId
+        ? `Bulk ranks ready (build ${bulkBuildId})`
+        : "Bulk ranks missing — run npm run bulk:score-publish and bake data/bulk/snapshot.json.gz into the deploy",
       samExtract.loaded && samExtract.count > 0
         ? `SAM exclusions loaded (${samExtract.count} UEIs, source: ${samExtract.source ?? "unknown"})`
         : "SAM exclusions not loaded (need data/sam/exclusions_ueis.txt in deploy or allow download)",

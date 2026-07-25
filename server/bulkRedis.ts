@@ -1,5 +1,6 @@
 /**
- * Publish / serve bulk scores via Upstash Redis (storage-tight for free 256MB).
+ * Optional Upstash Redis bulk ranks (legacy / shared multi-instance cache).
+ * Preferred path is static snapshot (see bulkSnapshot.ts) — no free-tier quota.
  *
  * Keys:
  *   gfw:bulk:current              → buildId
@@ -10,6 +11,12 @@
  */
 import { getRedis } from "./cache.js";
 import type { BulkScoredFacility } from "./bulkScore.js";
+import {
+  getBulkBuildIdFromSnapshot,
+  getFacilitiesFromSnapshot,
+  slimFacilityForBulk,
+  type BulkRankMeta,
+} from "./bulkSnapshot.js";
 import type {
   FacilitiesResponse,
   Facility,
@@ -18,6 +25,8 @@ import type {
 } from "./types.js";
 
 const PREFIX = "gfw:bulk:";
+
+export type { BulkRankMeta };
 
 export function bulkCurrentKey(): string {
   return `${PREFIX}current`;
@@ -43,112 +52,11 @@ export function bulkMetaKey(
   return `${PREFIX}${buildId}:meta:${state.toUpperCase()}:${type}`;
 }
 
-export interface BulkRankMeta {
-  nScored: number;
-  nInsufficient: number;
-  facilityCount: number;
-  builtAt: string;
-  buildId: string;
-}
-
 const DISCLAIMER =
   "Audit-worthiness ranking from offline bulk awards (USAspending archive) + FAC dissemination. Universe: assistance awards types 02–05 in loaded fiscal years. Not proof of fraud.";
 
-/** Minimal list row — avoids bloating free Upstash (256MB). */
 function slimFacilityForRedis(b: BulkScoredFacility): Facility {
-  // Keep real min/mean/max (+ rest of AmountFeatures) for deep-dive "How big are
-  // the amounts?" — these are ~15 numbers, not full award lists.
-  // Keep Benford digitCounts for the digit chart (9 ints). Never ship amounts[].
-  const features = b.features ?? {
-    n: b.sampleCount,
-    sum: b.grantReceived,
-    mean: b.avgAward ?? 0,
-    std: 0,
-    median: 0,
-    min: 0,
-    max: 0,
-    cv: 0,
-    maxToMean: 0,
-    pctRound: 0,
-    pctNegative: 0,
-    logSum: 0,
-    logMean: 0,
-    digitEntropy: 0,
-    benfordMad: 0,
-    benfordChi: 0,
-  };
-  const emptyDigitCounts: Record<string, number> = {
-    "1": 0,
-    "2": 0,
-    "3": 0,
-    "4": 0,
-    "5": 0,
-    "6": 0,
-    "7": 0,
-    "8": 0,
-    "9": 0,
-  };
-  const benford = b.benford ?? {
-    sampleSize: b.sampleCount,
-    chiSquare: null,
-    mad: null,
-    digitCounts: emptyDigitCounts,
-    minFullSample: 50,
-    minLowSample: 1,
-  };
-  return {
-    id: b.id,
-    name: b.name,
-    city: b.city,
-    county: b.county,
-    state: b.state,
-    grantReceived: b.grantReceived,
-    awardCount: b.awardCount,
-    grantsHydrated: true,
-    sampleCount: b.sampleCount,
-    fraudChance: b.fraudChance,
-    fraudLabel: b.fraudLabel,
-    confidence: b.confidence,
-    scoreMethod: b.scoreMethod,
-    scoreStatus: "ok",
-    benfordScore: b.benfordScore,
-    multiScore: b.multiScore,
-    signals: b.signals,
-    avgAward: b.avgAward,
-    primaryCfda: b.primaryCfda,
-    awardTypes: [],
-    uei: b.uei,
-    recipientId: b.recipientId ?? null,
-    benfordEligible: b.benfordEligible,
-    enrichment: {
-      fac: b.enrichment?.fac
-        ? {
-            found: b.enrichment.fac.found,
-            riskScore: b.enrichment.fac.riskScore,
-            findingsCount: b.enrichment.fac.findingsCount,
-            materialWeakness: b.enrichment.fac.materialWeakness,
-            goingConcern: b.enrichment.fac.goingConcern,
-            lowRiskAuditee: b.enrichment.fac.lowRiskAuditee,
-            reportId: b.enrichment.fac.reportId ?? null,
-            auditYear: b.enrichment.fac.auditYear ?? null,
-          }
-        : null,
-      sam: b.enrichment?.sam
-        ? {
-            found: b.enrichment.sam.found,
-            riskScore: b.enrichment.sam.riskScore,
-            excluded: b.enrichment.sam.excluded,
-            registrationAgeDays: b.enrichment.sam.registrationAgeDays,
-            legalBusinessName: null,
-          }
-        : null,
-      subaward: null,
-      temporal: null,
-    },
-    benford,
-    features,
-    deepScored: false,
-  };
+  return slimFacilityForBulk(b);
 }
 
 /**
@@ -306,10 +214,16 @@ export async function publishBulkBuild(
 }
 
 export async function getBulkBuildId(): Promise<string | null> {
+  const fromSnap = await getBulkBuildIdFromSnapshot();
+  if (fromSnap) return fromSnap;
   const r = getRedis();
   if (!r) return null;
-  const v = await r.get<string>(bulkCurrentKey());
-  return v ? String(v) : null;
+  try {
+    const v = await r.get<string>(bulkCurrentKey());
+    return v ? String(v) : null;
+  } catch {
+    return null;
+  }
 }
 
 function normPlace(s: string | null | undefined): string {
@@ -363,18 +277,27 @@ async function loadFacilitiesByIds(
 }
 
 /**
- * Serve ranked facilities from Redis bulk build.
- * City / county / name (q) filter in-memory on facility hashes — no live APIs.
+ * Serve ranked facilities: static snapshot first (GitHub / data/bulk), then Redis.
+ * City / county / name (q) filter in-memory — no live USAspending/FAC.
  */
 export async function getFacilitiesFromBulk(
   filters: FacilityFilters,
   page: number,
   pageSize: number,
 ): Promise<FacilitiesResponse | null> {
+  const fromSnap = await getFacilitiesFromSnapshot(filters, page, pageSize);
+  if (fromSnap) return fromSnap;
+
   const r = getRedis();
   if (!r) return null;
 
-  const buildId = await getBulkBuildId();
+  let buildId: string | null = null;
+  try {
+    const v = await r.get<string>(bulkCurrentKey());
+    buildId = v ? String(v) : null;
+  } catch {
+    return null;
+  }
   if (!buildId) return null;
 
   const state = filters.state?.trim().toUpperCase();
@@ -382,9 +305,14 @@ export async function getFacilitiesFromBulk(
 
   const type: FacilityTypeKey | string = filters.type ?? "all";
   const zkey = bulkRankKey(buildId, state, type);
-  const meta = await r.get<BulkRankMeta>(bulkMetaKey(buildId, state, type));
-
-  const zcard = (await r.zcard(zkey)) ?? 0;
+  let meta: BulkRankMeta | null = null;
+  let zcard = 0;
+  try {
+    meta = await r.get<BulkRankMeta>(bulkMetaKey(buildId, state, type));
+    zcard = (await r.zcard(zkey)) ?? 0;
+  } catch {
+    return null;
+  }
   if (!zcard && !meta?.nScored) return null;
 
   const cityQ = filters.city?.trim();
@@ -508,9 +436,22 @@ export async function bulkCoverage(
   state: string,
   type: string,
 ): Promise<BulkRankMeta | null> {
+  const {
+    ensureBulkSnapshotLoaded,
+  } = await import("./bulkSnapshot.js");
+  const snap = await ensureBulkSnapshotLoaded();
+  if (snap) {
+    const rk = `${state.toUpperCase()}|${type}`;
+    return snap.meta[rk] ?? null;
+  }
   const r = getRedis();
   if (!r) return null;
-  const buildId = await getBulkBuildId();
-  if (!buildId) return null;
-  return r.get<BulkRankMeta>(bulkMetaKey(buildId, state, type));
+  try {
+    const v = await r.get<string>(bulkCurrentKey());
+    const buildId = v ? String(v) : null;
+    if (!buildId) return null;
+    return r.get<BulkRankMeta>(bulkMetaKey(buildId, state, type));
+  } catch {
+    return null;
+  }
 }
